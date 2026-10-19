@@ -1,0 +1,29 @@
+
+# Environment variables and API keys
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+
+# Virtual environment
+.venv/
+venv/
+
+# Testing and coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# IDE and operating system
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Generated data and local indexes
+data/processed/
+data/indexes/
