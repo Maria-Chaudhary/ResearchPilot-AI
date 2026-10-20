@@ -16,7 +16,12 @@ def process_pdf(pdf_file):
 
     try:
         pages = extract_text_from_pdf(pdf_file)
-        chunks = chunk_pages(pages)
+        
+        chunks = chunk_pages(
+           pages,
+          chunk_size=1000,
+           overlap=150,
+)
 
         store = FaissVectorStore()
         store.add_chunks(chunks)
@@ -42,7 +47,7 @@ def ask_question(question, store):
         return "Please enter a question.", ""
 
     try:
-        result = answer_question(store, question)
+        result = answer_question(store, question, top_k=3)
 
         answer = result["answer"]
         sources = result.get("sources", [])
