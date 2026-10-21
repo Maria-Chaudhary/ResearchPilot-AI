@@ -1,0 +1,54 @@
+{
+  "pdf": "V2I10-1170.pdf",
+  "dataset": "C:\\Users\\Maria\\Desktop\\researchpilot-ai\\researchpilot-ai\\data\\evaluation_dataset.json",
+  "top_k": 3,
+  "number_of_questions": 3,
+  "number_of_chunks": 18,
+  "recall_at_k": 0.3333,
+  "mean_reciprocal_rank": 0.3333,
+  "hit_rate": 0.3333,
+  "results": [
+    {
+      "question": "What is the main objective of the study?",
+      "relevant_pages": [
+        2
+      ],
+      "retrieved_pages": [
+        3,
+        1,
+        1
+      ],
+      "recall_at_k": 0.0,
+      "reciprocal_rank": 0.0,
+      "hit": false
+    },
+    {
+      "question": "What methodology did the researchers use?",
+      "relevant_pages": [
+        3
+      ],
+      "retrieved_pages": [
+        3,
+        1,
+        2
+      ],
+      "recall_at_k": 1.0,
+      "reciprocal_rank": 1.0,
+      "hit": true
+    },
+    {
+      "question": "What are the main findings?",
+      "relevant_pages": [
+        5
+      ],
+      "retrieved_pages": [
+        3,
+        4,
+        1
+      ],
+      "recall_at_k": 0.0,
+      "reciprocal_rank": 0.0,
+      "hit": false
+    }
+  ]
+}

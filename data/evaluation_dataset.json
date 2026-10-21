@@ -1,0 +1,18 @@
+
+[
+  {
+    "question": "What is the main objective of the study?",
+    "expected_answer": "The study discusses how artificial intelligence has advanced and improved everyday human activities through technologies such as machine learning and neural networks.",
+    "relevant_pages": [2]
+  },
+  {
+    "question": "What methodology did the researchers use?",
+    "expected_answer": "The study uses an analysis based on previous academic research, books, and journals related to the subject.",
+    "relevant_pages": [3]
+  },
+  {
+    "question": "What are the main findings?",
+    "expected_answer": "The paper describes AI applications in automated transport systems, robots performing dangerous jobs, and computerized methods such as GPS and smartphone technology.",
+    "relevant_pages": [5]
+  }
+]
