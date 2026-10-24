@@ -1,4 +1,3 @@
-
 import gradio as gr
 
 from app.ingestion.pdf_parser import extract_text_from_pdf
@@ -12,22 +11,38 @@ from app.generation.answer_service import answer_question
 # ─────────────────────────────────────────────
 
 CUSTOM_CSS = """
-@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Manrope:wght@400;500;600;700;800&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Manrope:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap');
 
 :root {
-    --rp-bg: #f5f7fb;
+    --rp-bg: #f6f4fb;
+    --rp-bg-2: #efeafc;
     --rp-card: #ffffff;
-    --rp-text: #182235;
-    --rp-muted: #69758a;
-    --rp-primary: #5b5bd6;
-    --rp-border: #e5e9f2;
+    --rp-text: #1a1533;
+    --rp-muted: #6b6588;
+    --rp-primary: #6d28d9;
+    --rp-primary-2: #8b5cf6;
+    --rp-primary-3: #a78bfa;
+    --rp-accent: #c026d3;
+    --rp-border: #e8e2f7;
+    --rp-border-strong: #d6c9f5;
+    --rp-shadow: 0 4px 24px rgba(88, 45, 180, 0.06);
+    --rp-shadow-lg: 0 20px 50px rgba(88, 45, 180, 0.12);
+}
+
+* {
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
 }
 
 .gradio-container {
     font-family: 'DM Sans', sans-serif !important;
-    background: var(--rp-bg) !important;
-    max-width: 1250px !important;
+    background:
+        radial-gradient(1200px 600px at 10% -10%, #ede4ff 0%, transparent 55%),
+        radial-gradient(1000px 500px at 100% 0%, #f3e8ff 0%, transparent 50%),
+        var(--rp-bg) !important;
+    max-width: 1280px !important;
     margin: auto !important;
+    padding: 28px 24px 10px !important;
 }
 
 .gradio-container h1,
@@ -35,116 +50,326 @@ CUSTOM_CSS = """
 .gradio-container h3 {
     font-family: 'Manrope', sans-serif !important;
     color: var(--rp-text) !important;
+    letter-spacing: -0.4px;
 }
 
+/* ── Header ─────────────────────────────── */
 #rp-header {
-    background: linear-gradient(125deg, #20254b 0%, #4545a8 58%, #7774e8 100%);
-    border-radius: 24px;
-    padding: 34px 36px;
+    position: relative;
+    background:
+        radial-gradient(900px 400px at 85% -30%, rgba(192, 38, 211, 0.55) 0%, transparent 60%),
+        radial-gradient(700px 500px at 0% 120%, rgba(139, 92, 246, 0.55) 0%, transparent 55%),
+        linear-gradient(135deg, #1e1147 0%, #3b1d8f 45%, #6d28d9 100%);
+    border-radius: 28px;
+    padding: 44px 48px 42px;
     color: white;
-    margin-bottom: 22px;
-    box-shadow: 0 14px 35px rgba(55, 55, 135, 0.15);
+    margin-bottom: 26px;
+    overflow: hidden;
+    box-shadow: 0 30px 60px -20px rgba(76, 29, 149, 0.55);
+    isolation: isolate;
+}
+
+#rp-header::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    background-image:
+        linear-gradient(rgba(255, 255, 255, 0.045) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(255, 255, 255, 0.045) 1px, transparent 1px);
+    background-size: 42px 42px;
+    mask-image: radial-gradient(ellipse at 30% 0%, black 20%, transparent 75%);
+    -webkit-mask-image: radial-gradient(ellipse at 30% 0%, black 20%, transparent 75%);
+    pointer-events: none;
+    z-index: -1;
+}
+
+#rp-header::after {
+    content: "";
+    position: absolute;
+    width: 320px;
+    height: 320px;
+    right: -90px;
+    top: -110px;
+    background: radial-gradient(circle, rgba(167, 139, 250, 0.55), transparent 65%);
+    filter: blur(10px);
+    z-index: -1;
 }
 
 #rp-header h1 {
-    color: white !important;
-    font-size: clamp(28px, 4vw, 42px) !important;
+    color: #ffffff !important;
+    font-size: clamp(30px, 4.4vw, 46px) !important;
     font-weight: 800 !important;
-    letter-spacing: -1.4px;
-    margin-bottom: 8px;
+    letter-spacing: -1.6px;
+    margin: 0 0 12px !important;
+    background: linear-gradient(100deg, #ffffff 30%, #e9d5ff 70%, #f0abfc 100%);
+    -webkit-background-clip: text;
+    background-clip: text;
+    -webkit-text-fill-color: transparent;
 }
 
 #rp-header p {
-    color: #e4e5ff !important;
-    font-size: 15px;
-    line-height: 1.7;
+    color: #ddd2fb !important;
+    font-size: 15.5px;
+    line-height: 1.75;
+    max-width: 640px;
+    margin: 0;
 }
 
 .rp-eyebrow {
-    color: #c8caff;
+    display: inline-block;
+    color: #e9d5ff;
     text-transform: uppercase;
-    letter-spacing: 2px;
+    letter-spacing: 2.4px;
     font-size: 11px;
     font-weight: 700;
-    margin-bottom: 12px;
+    margin-bottom: 16px;
+    padding: 6px 14px;
+    border-radius: 999px;
+    background: rgba(167, 139, 250, 0.16);
+    border: 1px solid rgba(196, 181, 253, 0.35);
+    backdrop-filter: blur(6px);
 }
 
+/* ── Cards ──────────────────────────────── */
 .rp-card {
     background: var(--rp-card);
     border: 1px solid var(--rp-border);
-    border-radius: 19px;
-    padding: 20px;
-    box-shadow: 0 5px 18px rgba(35, 48, 80, 0.035);
+    border-radius: 22px;
+    padding: 26px 26px 24px;
+    box-shadow: var(--rp-shadow);
+    transition: box-shadow 0.28s ease, border-color 0.28s ease, transform 0.28s ease;
+    position: relative;
+    overflow: hidden;
+}
+
+.rp-card::before {
+    content: "";
+    position: absolute;
+    inset: 0 0 auto 0;
+    height: 3px;
+    background: linear-gradient(90deg, var(--rp-primary-2), var(--rp-accent), var(--rp-primary));
+    opacity: 0.85;
+}
+
+.rp-card:hover {
+    box-shadow: var(--rp-shadow-lg);
+    border-color: var(--rp-border-strong);
+    transform: translateY(-2px);
+}
+
+.rp-card h3 {
+    font-size: 20px !important;
+    font-weight: 700 !important;
+    margin: 2px 0 8px !important;
 }
 
 .rp-section-label {
-    font-size: 12px;
+    display: inline-block;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
     text-transform: uppercase;
-    letter-spacing: 1.3px;
-    font-weight: 700;
+    letter-spacing: 1.6px;
+    font-weight: 500;
     color: var(--rp-primary);
-    margin-bottom: 7px;
+    margin-bottom: 10px;
+    padding: 4px 10px;
+    border-radius: 7px;
+    background: linear-gradient(120deg, #f3ecff 0%, #fbefff 100%);
+    border: 1px solid #eadcff;
 }
 
 .rp-muted {
     color: var(--rp-muted);
-    font-size: 13px;
-    line-height: 1.65;
+    font-size: 13.5px;
+    line-height: 1.7;
+}
+
+/* ── Buttons ────────────────────────────── */
+#rp-process-btn,
+#rp-ask-btn {
+    min-height: 50px;
+    border-radius: 14px !important;
+    font-weight: 700 !important;
+    font-size: 14.5px !important;
+    letter-spacing: 0.2px;
+    border: none !important;
+    transition: transform 0.18s ease, box-shadow 0.18s ease, filter 0.18s ease !important;
+    position: relative;
+    overflow: hidden;
 }
 
 #rp-process-btn {
-    min-height: 48px;
-    border-radius: 12px !important;
-    font-weight: 700 !important;
-    background: #5b5bd6 !important;
-    border: none !important;
+    background: linear-gradient(135deg, #7c3aed 0%, #6d28d9 55%, #5b21b6 100%) !important;
+    color: #fff !important;
+    box-shadow: 0 10px 24px -8px rgba(109, 40, 217, 0.65) !important;
 }
 
 #rp-ask-btn {
-    min-height: 48px;
-    border-radius: 12px !important;
-    font-weight: 700 !important;
-    background: #252b50 !important;
-    border: none !important;
+    background: linear-gradient(135deg, #3b1d8f 0%, #2a1566 100%) !important;
+    color: #fff !important;
+    box-shadow: 0 10px 24px -8px rgba(42, 21, 102, 0.55) !important;
 }
 
-#rp-answer {
-    background: white;
-    border: 1px solid var(--rp-border);
-    border-radius: 16px;
-    padding: 20px;
-    min-height: 180px;
+#rp-process-btn:hover,
+#rp-ask-btn:hover {
+    transform: translateY(-2px);
+    filter: brightness(1.06);
 }
 
-#rp-status textarea,
-#rp-sources textarea {
-    border-radius: 12px !important;
-    line-height: 1.65 !important;
-}
-
-textarea, input {
-    border-radius: 11px !important;
+#rp-process-btn:active,
+#rp-ask-btn:active {
+    transform: translateY(0);
 }
 
 button {
     transition: transform 0.18s ease, box-shadow 0.18s ease !important;
+    font-weight: 600 !important;
 }
 
 button:hover {
     transform: translateY(-1px);
 }
 
+/* Secondary / clear buttons */
+.gradio-container button.secondary,
+.gradio-container .secondary {
+    border-radius: 14px !important;
+    border: 1px solid var(--rp-border-strong) !important;
+    background: #fbf9ff !important;
+    color: var(--rp-primary) !important;
+    min-height: 50px;
+    font-weight: 600 !important;
+}
+
+.gradio-container button.secondary:hover,
+.gradio-container .secondary:hover {
+    background: #f3ecff !important;
+    border-color: var(--rp-primary-3) !important;
+}
+
+/* ── Inputs / textareas ─────────────────── */
+textarea, input[type="text"], input[type="number"] {
+    border-radius: 13px !important;
+    border-color: var(--rp-border) !important;
+    background: #fdfcff !important;
+    font-size: 14px !important;
+    transition: border-color 0.2s ease, box-shadow 0.2s ease !important;
+}
+
+textarea:focus, input[type="text"]:focus {
+    border-color: var(--rp-primary-2) !important;
+    box-shadow: 0 0 0 4px rgba(139, 92, 246, 0.14) !important;
+    background: #ffffff !important;
+}
+
+/* Labels */
+.gradio-container label > span,
+.gradio-container .label-wrap > span {
+    font-weight: 600 !important;
+    color: #4b4568 !important;
+    font-size: 12.5px !important;
+    letter-spacing: 0.3px;
+}
+
+/* ── File uploader ──────────────────────── */
+.gradio-container .file-preview,
+.gradio-container [data-testid="block-label"] {
+    border-radius: 14px !important;
+}
+
+.gradio-container .upload-container,
+.gradio-container .file-upload {
+    border: 2px dashed var(--rp-border-strong) !important;
+    border-radius: 16px !important;
+    background: linear-gradient(180deg, #fbf8ff 0%, #f7f2ff 100%) !important;
+    transition: border-color 0.22s ease, background 0.22s ease !important;
+}
+
+.gradio-container .upload-container:hover,
+.gradio-container .file-upload:hover {
+    border-color: var(--rp-primary-2) !important;
+    background: #f5eeff !important;
+}
+
+/* ── Answer output ──────────────────────── */
+#rp-answer {
+    background:
+        linear-gradient(180deg, #fdfcff 0%, #faf6ff 100%);
+    border: 1px solid var(--rp-border);
+    border-left: 4px solid var(--rp-primary-2);
+    border-radius: 16px;
+    padding: 22px 24px;
+    min-height: 180px;
+    line-height: 1.75;
+    color: #2a2344;
+    font-size: 14.5px;
+    box-shadow: inset 0 1px 2px rgba(109, 40, 217, 0.03);
+}
+
+#rp-answer p {
+    color: #2a2344 !important;
+}
+
+/* ── Status + sources textareas ─────────── */
+#rp-status textarea {
+    border-radius: 13px !important;
+    line-height: 1.7 !important;
+    background: linear-gradient(180deg, #fbf9ff 0%, #f8f4ff 100%) !important;
+    font-family: 'JetBrains Mono', monospace !important;
+    font-size: 12.5px !important;
+    color: #3a3159 !important;
+    border-color: var(--rp-border) !important;
+}
+
+#rp-sources textarea {
+    border-radius: 13px !important;
+    line-height: 1.75 !important;
+    background: linear-gradient(180deg, #fcfaff 0%, #faf6ff 100%) !important;
+    font-family: 'JetBrains Mono', monospace !important;
+    font-size: 12.5px !important;
+    color: #3a3159 !important;
+    border-color: var(--rp-border) !important;
+}
+
+/* ── Scrollbar ──────────────────────────── */
+::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+}
+
+::-webkit-scrollbar-track {
+    background: #f2ecff;
+    border-radius: 10px;
+}
+
+::-webkit-scrollbar-thumb {
+    background: linear-gradient(180deg, #c4b5fd, #a78bfa);
+    border-radius: 10px;
+    border: 2px solid #f2ecff;
+}
+
+::-webkit-scrollbar-thumb:hover {
+    background: linear-gradient(180deg, #a78bfa, #8b5cf6);
+}
+
+/* ── Footer ─────────────────────────────── */
 footer {
     display: none !important;
 }
 
+/* ── Responsive ─────────────────────────── */
 @media (max-width: 700px) {
+    .gradio-container {
+        padding: 16px 12px 6px !important;
+    }
+
     #rp-header {
-        padding: 24px 20px;
+        padding: 30px 24px;
+        border-radius: 22px;
     }
 
     .rp-card {
-        padding: 15px;
+        padding: 20px 18px;
     }
 }
 """
@@ -241,8 +466,8 @@ def ask_question(question, store):
 
 with gr.Blocks(
     theme=gr.themes.Soft(
-        primary_hue="indigo",
-        secondary_hue="slate",
+        primary_hue="purple",
+        secondary_hue="violet",
         neutral_hue="slate",
         radius_size="lg",
         spacing_size="md",
@@ -369,7 +594,7 @@ with gr.Blocks(
 
     gr.Markdown(
         """
-        <div style="text-align:center; padding:22px 8px; color:#7b8497;">
+        <div style="text-align:center; padding:22px 8px; color:#7b6ba8; font-size:13px; letter-spacing:0.3px;">
             ResearchPilot AI · Evidence-grounded academic reading
         </div>
         """

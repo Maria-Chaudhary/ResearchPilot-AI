@@ -1,328 +1,442 @@
 
 import os
 import re
+from pathlib import Path
 from typing import Any
 
 import httpx
+from dotenv import load_dotenv
 
-import os
-import re
-import httpx
 
+# ---------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+ENV_FILE = PROJECT_ROOT / ".env"
+
+load_dotenv(ENV_FILE)
+
+# Keep this module-level variable so tests can mock it.
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+GROQ_MODEL = os.getenv(
+    "GROQ_MODEL",
+    "llama-3.3-70b-versatile",
+)
 
 MAX_CONTEXT_PASSAGES = 8
 MAX_PASSAGE_CHARACTERS = 2800
 MAX_ANSWER_TOKENS = 700
 
-# Map-reduce settings. These are deliberately modest for a CPU-only laptop.
 SUMMARY_BATCH_SIZE = 5
 SUMMARY_CHUNK_CHARACTERS = 2400
 SUMMARY_BATCH_TOKENS = 650
 SUMMARY_FINAL_TOKENS = 1000
 
 
-SUMMARY_PATTERNS = (
-    r"\bsummar(?:y|ize|ise)\b",
-    r"\boverview\b",
-    r"\bwhat is this paper about\b",
-    r"\bwhat is the paper about\b",
-    r"\bwhat does this paper discuss\b",
-    r"\bmain topic\b",
-    r"\bkey contributions\b",
-    r"\bwhole paper\b",
-    r"\bentire paper\b",
-    r"\bsummarize the article\b",
-    r"\bsummarise the article\b",
-)
-
-QUESTION_TYPES = {
-    "goals": (
-        r"\bgoals?\b", r"\bobjectives?\b", r"\baims?\b",
-        r"\bpurpose\b",
-    ),
-    "methodology": (
-        r"\bmethod(?:s|ology)?\b", r"\bapproach\b",
-        r"\bexperimental setup\b", r"\bdata collection\b",
-        r"\bhow was\b", r"\bhow were\b",
-    ),
-    "results": (
-        r"\bresults?\b", r"\bfindings?\b", r"\boutcomes?\b",
-        r"\bwhat did .* find\b", r"\bperformance\b",
-    ),
-    "limitations": (
-        r"\blimitations?\b", r"\bweakness(?:es)?\b",
-        r"\bshortcomings?\b", r"\bfuture work\b",
-    ),
-}
-
+# ---------------------------------------------------------
+# Groq API
+# ---------------------------------------------------------
 
 def _call_groq(
     system_prompt: str,
     user_prompt: str,
-    max_tokens: int,
+    max_tokens: int = MAX_ANSWER_TOKENS,
 ) -> str:
-    """Make one Groq request without exposing secrets to the UI."""
-    api_key = GROQ_API_KEY
-    if not api_key:
-        raise RuntimeError(
-            "GROQ_API_KEY is missing. Configure it in your local .env file."
+    """Send a chat-completion request to Groq."""
+
+    if not GROQ_API_KEY:
+        raise ValueError(
+            "GROQ_API_KEY is missing. Add it to your root .env file."
         )
+
+    payload = {
+        "model": GROQ_MODEL,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "temperature": 0.1,
+        "max_tokens": max_tokens,
+    }
 
     response = httpx.post(
         GROQ_API_URL,
         headers={
-            "Authorization": f"Bearer {api_key}",
+            "Authorization": f"Bearer {GROQ_API_KEY}",
             "Content-Type": "application/json",
         },
-        json={
-            "model": GROQ_MODEL,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            "temperature": 0.1,
-            "max_tokens": max_tokens,
-        },
+        json=payload,
         timeout=90.0,
     )
     response.raise_for_status()
 
     data = response.json()
-    answer = data["choices"][0]["message"]["content"].strip()
-    if not answer:
-        raise ValueError("The language model returned an empty answer.")
-    return answer
+
+    try:
+        content = data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError) as exc:
+        raise ValueError(
+            "Groq returned an unexpected response format."
+        ) from exc
+
+    if not isinstance(content, str) or not content.strip():
+        raise ValueError("Groq returned an empty answer.")
+
+    return content.strip()
 
 
-def _classify_question(question: str) -> str:
-    q = question.lower().strip()
+# ---------------------------------------------------------
+# General helpers
+# ---------------------------------------------------------
 
-    if any(re.search(pattern, q) for pattern in SUMMARY_PATTERNS):
-        return "summary"
+def _page_number(chunk: dict[str, Any]) -> str:
+    """Return a readable page number for a chunk."""
 
-    for kind, patterns in QUESTION_TYPES.items():
-        if any(re.search(pattern, q) for pattern in patterns):
-            return kind
+    page = chunk.get("page", chunk.get("page_number", "?"))
 
-    return "specific"
+    if page is None:
+        return "?"
+
+    return str(page)
 
 
-def _section(item: dict[str, Any]) -> str:
-    section = str(item.get("section", "general")).strip().lower()
-    aliases = {
-        "abstract": "abstract",
-        "introduction": "introduction",
-        "background": "introduction",
-        "related work": "related_work",
-        "literature review": "related_work",
-        "methods": "methodology",
-        "methodology": "methodology",
-        "research methodology": "methodology",
-        "materials and methods": "methodology",
-        "experimental setup": "methodology",
-        "results": "results",
-        "findings": "results",
-        "results and discussion": "results",
-        "discussion": "discussion",
-        "conclusion": "conclusion",
-        "conclusions": "conclusion",
-        "limitations": "limitations",
-        "future work": "limitations",
-        "references": "references",
-        "bibliography": "references",
+def _chunk_identity(chunk: dict[str, Any]) -> tuple:
+    """Create a stable identity for deduplicating chunks."""
+
+    chunk_id = chunk.get("chunk_id")
+
+    if chunk_id is not None:
+        return ("id", str(chunk_id))
+
+    return (
+        "content",
+        _page_number(chunk),
+        re.sub(r"\W+", " ", str(chunk.get("text", "")).lower()).strip(),
+    )
+
+
+def _section(chunk: dict[str, Any]) -> str:
+    return str(chunk.get("section", "General")).strip() or "General"
+
+
+def _is_reference(chunk: dict[str, Any]) -> bool:
+    """Conservatively identify reference-list chunks."""
+
+    section = _section(chunk).lower().strip()
+
+    reference_headings = {
+        "references",
+        "bibliography",
+        "works cited",
+        "literature cited",
+        "selected references",
     }
 
-    if section in aliases:
-        return aliases[section]
-
-    text = str(item.get("text", ""))
-    for line in text.splitlines()[:4]:
-        normalized = re.sub(r"[^a-z ]", "", line.lower()).strip()
-        if normalized in aliases:
-            return aliases[normalized]
-
-    return "general"
-
-
-def _is_reference(item: dict[str, Any]) -> bool:
-    if item.get("is_reference") is True:
+    if section in reference_headings:
         return True
-    return _section(item) == "references"
+
+    text = str(chunk.get("text", ""))
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+
+    if not lines:
+        return False
+
+    for line in lines[:3]:
+        cleaned = re.sub(r"[^a-z ]", "", line.lower()).strip()
+        if cleaned in reference_headings:
+            return True
+
+    citation_count = 0
+
+    for line in lines:
+        has_year = bool(re.search(r"\b(?:19|20)\d{2}[a-z]?\b", line))
+        has_citation_cue = bool(
+            re.search(
+                r"\b(doi:|proceedings|journal of|vol\.|pp\.|"
+                r"technical report|university press)\b",
+                line,
+                re.IGNORECASE,
+            )
+        )
+
+        if has_year and has_citation_cue:
+            citation_count += 1
+
+    return (
+        len(lines) >= 4
+        and citation_count >= 3
+        and citation_count / len(lines) >= 0.55
+    )
 
 
 def _terms(text: str) -> set[str]:
+    """Extract useful terms for lightweight relevance ranking."""
+
     stop_words = {
-        "the", "a", "an", "is", "are", "was", "were", "of", "to",
-        "in", "on", "for", "and", "or", "with", "by", "from", "as",
-        "it", "this", "that", "what", "which", "how", "does", "do",
-        "did", "about", "paper", "article", "explain", "describe",
-        "discuss", "discussed", "please", "tell", "me", "give",
+        "a", "an", "the", "is", "are", "was", "were", "be", "been",
+        "being", "of", "to", "in", "on", "for", "and", "or", "but",
+        "with", "by", "from", "at", "as", "it", "this", "that",
+        "these", "those", "what", "which", "who", "when", "where",
+        "why", "how", "do", "does", "did", "can", "could", "would",
+        "should", "about", "paper", "article", "please", "explain",
+        "describe", "tell", "me", "give", "show",
     }
+
+    words = re.findall(
+        r"[a-zA-Z0-9]+(?:[-'][a-zA-Z0-9]+)*",
+        text.lower(),
+    )
+
     return {
-        token for token in re.findall(r"[a-zA-Z0-9]+", text.lower())
-        if len(token) > 1 and token not in stop_words
+        word for word in words
+        if len(word) > 1 and word not in stop_words
     }
 
 
 def _relevance_bonus(
     question: str,
-    item: dict[str, Any],
-    question_type: str,
+    chunk: dict[str, Any],
 ) -> float:
-    text = str(item.get("text", "")).lower()
-    section = _section(item)
-    bonus = 0.0
+    """Add a modest exact-term relevance bonus."""
 
-    if question_type == "goals":
-        if re.search(r"\b(goals?|aims?|objectives?|purpose)\b", text):
-            bonus += 0.20
-        if re.search(
-            r"\b(main|primary|principal)\s+(goal|aim|objective)",
-            text,
-        ):
-            bonus += 0.30
-        if section in {"abstract", "introduction"}:
-            bonus += 0.08
+    question_terms = _terms(question)
+    text = str(chunk.get("text", ""))
+    text_terms = _terms(text)
 
-    elif question_type == "methodology":
-        if section == "methodology":
-            bonus += 0.35
-        if re.search(
-            r"\b(method|methodology|procedure|experiment|dataset)\b",
-            text,
-        ):
-            bonus += 0.15
+    if not question_terms:
+        return 0.0
 
-    elif question_type == "results":
-        if section == "results":
-            bonus += 0.35
-        if re.search(
-            r"\b(results?|findings?|accuracy|performance)\b",
-            text,
-        ):
-            bonus += 0.15
-
-    elif question_type == "limitations":
-        if section == "limitations":
-            bonus += 0.35
-        if re.search(
-            r"\b(limitation|future work|challenge|weakness)\b",
-            text,
-        ):
-            bonus += 0.15
-
-    terms = _terms(question)
-    passage_terms = _terms(text)
-    if terms:
-        bonus += 0.25 * len(terms & passage_terms) / len(terms)
-
-    return bonus
+    coverage = len(question_terms & text_terms) / len(question_terms)
+    return 0.15 * coverage
 
 
 def _rank_candidates(
     question: str,
     candidates: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    kind = _classify_question(question)
+    """Rank retrieved candidates without losing their source metadata."""
+
     ranked = []
 
-    for original in candidates:
-        item = dict(original)
-        base = float(item.get("similarity", 0.0))
-        bonus = _relevance_bonus(question, item, kind)
-        penalty = 1.0 if _is_reference(item) else 0.0
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
 
-        item["ranking_score"] = round(base + bonus - penalty, 4)
-        item["relevance_bonus"] = round(bonus, 4)
-        item["is_reference"] = _is_reference(item)
+        text = candidate.get("text")
+
+        if not isinstance(text, str) or not text.strip():
+            continue
+
+        item = dict(candidate)
+
+        try:
+            base_score = float(
+                item.get("similarity", item.get("score", 0.0))
+            )
+        except (TypeError, ValueError):
+            base_score = 0.0
+
+        item["_ranking_score"] = (
+            base_score + _relevance_bonus(question, item)
+        )
+
+        if _is_reference(item):
+            item["_ranking_score"] -= 0.35
+
         ranked.append(item)
 
     ranked.sort(
         key=lambda item: (
-            item["ranking_score"],
-            float(item.get("keyword_score", 0.0)),
-            float(item.get("semantic_similarity", 0.0)),
+            item["_ranking_score"],
+            float(item.get("semantic_similarity", 0.0) or 0.0),
+            float(item.get("query_term_coverage", 0.0) or 0.0),
         ),
         reverse=True,
     )
+
     return ranked
 
 
 def _select_passages(
-    ranked: list[dict[str, Any]],
-    max_passages: int,
+    question: str,
+    candidates: list[dict[str, Any]],
+    limit: int = MAX_CONTEXT_PASSAGES,
 ) -> list[dict[str, Any]]:
-    candidates = [item for item in ranked if not _is_reference(item)]
-    if not candidates:
-        candidates = ranked
+    """Select relevant, nonduplicate passages."""
+
+    ranked = _rank_candidates(question, candidates)
 
     selected = []
     seen_ids = set()
-    seen_text = set()
+    seen_texts = set()
 
-    for item in candidates:
-        identity = item.get(
-            "chunk_id",
-            (item.get("page"), item.get("text")),
-        )
+    for item in ranked:
+        identity = _chunk_identity(item)
+
         normalized_text = re.sub(
-            r"\W+", " ", str(item.get("text", "")).lower()
+            r"\W+",
+            " ",
+            str(item.get("text", "")).lower(),
         ).strip()
 
-        if identity in seen_ids or not normalized_text or normalized_text in seen_text:
+        if not normalized_text:
             continue
 
-        selected.append(item)
-        seen_ids.add(identity)
-        seen_text.add(normalized_text)
+        if identity in seen_ids or normalized_text in seen_texts:
+            continue
 
-        if len(selected) >= max_passages:
+        seen_ids.add(identity)
+        seen_texts.add(normalized_text)
+
+        item.pop("_ranking_score", None)
+        selected.append(item)
+
+        if len(selected) >= limit:
             break
 
     return selected
 
 
 def _format_sources(
-    passages: list[dict[str, Any]],
+    chunks: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    sources = []
+    """Format source metadata for the existing UI."""
 
-    for item in passages:
-        sources.append({
-            "page": item.get("page", "Unknown"),
-            "text": item.get("text", ""),
-            "section": item.get("section", "General"),
-            "similarity": item.get("similarity", 0.0),
-            "ranking_score": item.get(
-                "ranking_score", item.get("similarity", 0.0)
-            ),
-            "chunk_id": item.get("chunk_id"),
-        })
+    sources = []
+    seen = set()
+
+    for chunk in chunks:
+        text = str(chunk.get("text", "")).strip()
+
+        if not text:
+            continue
+
+        identity = _chunk_identity(chunk)
+
+        if identity in seen:
+            continue
+
+        seen.add(identity)
+
+        source = {
+            "page": chunk.get("page", chunk.get("page_number")),
+            "section": _section(chunk),
+            "text": text,
+        }
+
+        if chunk.get("chunk_id") is not None:
+            source["chunk_id"] = chunk["chunk_id"]
+
+        if chunk.get("similarity") is not None:
+            source["similarity"] = chunk["similarity"]
+
+        if chunk.get("semantic_similarity") is not None:
+            source["semantic_similarity"] = (
+                chunk["semantic_similarity"]
+            )
+
+        sources.append(source)
 
     return sources
 
 
-def _build_context(sources: list[dict[str, Any]]) -> str:
-    blocks = []
-    for i, source in enumerate(sources, start=1):
-        text = str(source["text"])[:MAX_PASSAGE_CHARACTERS]
-        blocks.append(
-            f"[SOURCE {i} | PAGE {source['page']} | "
-            f"SECTION {source['section']}]\n{text}"
-        )
-    return "\n\n---\n\n".join(blocks)
+def _build_context(
+    chunks: list[dict[str, Any]],
+    max_chars: int = MAX_PASSAGE_CHARACTERS,
+) -> str:
+    """Build a page-labelled evidence context."""
 
+    sections = []
+
+    for chunk in chunks:
+        text = str(chunk.get("text", "")).strip()
+
+        if not text:
+            continue
+
+        if len(text) > max_chars:
+            text = text[:max_chars].rsplit(" ", 1)[0] + " ..."
+
+        sections.append(
+            f"[Page {_page_number(chunk)} | "
+            f"Section: {_section(chunk)}]\n{text}"
+        )
+
+    return "\n\n---\n\n".join(sections)
+
+
+# ---------------------------------------------------------
+# Question classification
+# ---------------------------------------------------------
+
+def _classify_question(question: str) -> str:
+    """Identify whole-paper summaries and common research questions."""
+
+    q = question.lower().strip()
+
+    summary_patterns = [
+        r"\bsummary\b",
+        r"\bsummarize\b",
+        r"\bsummarise\b",
+        r"\boverview\b",
+        r"\bwhat is this paper about\b",
+        r"\bwhat does this paper discuss\b",
+        r"\bgive me the gist\b",
+        r"\bsummarize the whole paper\b",
+        r"\bsummarise the whole paper\b",
+        r"\bwhole[- ]paper summary\b",
+    ]
+
+    if any(re.search(pattern, q) for pattern in summary_patterns):
+        return "summary"
+
+    if re.search(
+        r"\b(aim|aims|objective|objectives|purpose|research question)\b",
+        q,
+    ):
+        return "goals"
+
+    if re.search(
+        r"\b(method|methods|methodology|approach|dataset|data collection|"
+        r"experimental setup|algorithm|model architecture)\b",
+        q,
+    ):
+        return "methodology"
+
+    if re.search(
+        r"\b(result|results|finding|findings|performance|accuracy|"
+        r"evaluation|outcome|outcomes)\b",
+        q,
+    ):
+        return "results"
+
+    if re.search(
+        r"\b(limitation|limitations|weakness|weaknesses|future work|"
+        r"future direction|drawback|drawbacks)\b",
+        q,
+    ):
+        return "limitations"
+
+    return "specific"
+
+
+# ---------------------------------------------------------
+# Whole-paper summary
+# ---------------------------------------------------------
 
 def _whole_document_summary(
     all_chunks: list[dict[str, Any]],
 ) -> tuple[str, list[dict[str, Any]]]:
     """
-    Map-reduce over every non-reference chunk in the indexed document.
-    Returns a final summary and the original source chunks used.
+    Summarize all available non-reference chunks using map-reduce.
+
+    Each batch is summarized, then the partial summaries are reduced
+    into a final structured answer.
     """
+
     content_chunks = [
         chunk for chunk in all_chunks
         if str(chunk.get("text", "")).strip()
@@ -336,246 +450,285 @@ def _whole_document_summary(
         ]
 
     if not content_chunks:
-        return "No readable content was found in this document.", []
+        return "No readable document text was found.", []
 
-    # Keep the original chunk order to preserve the paper's narrative.
-    content_chunks.sort(
-        key=lambda item: (
-            int(item.get("page", 0))
-            if str(item.get("page", "")).isdigit()
-            else 0,
-            str(item.get("chunk_id", "")),
-        )
-    )
+    # Sort numerically by page when possible, then by chunk ID.
+    def sort_key(chunk: dict[str, Any]) -> tuple:
+        page = chunk.get("page", chunk.get("page_number", 0))
 
-    map_system = """
-You are analyzing part of a research paper for a document-level summary.
-Summarize only the supplied text. Preserve important claims, methods,
-findings, limitations, definitions, and conclusions. Do not invent details.
-Write concise notes in your own words. Keep page markers such as [Page 3]
-next to facts so they can be cited later. Ignore bibliography-only material.
-""".strip()
+        try:
+            page_key = (0, int(page))
+        except (TypeError, ValueError):
+            page_key = (1, str(page))
 
-    intermediate_summaries = []
-    used_chunks = []
+        chunk_id = chunk.get("chunk_id", 0)
 
-    # MAP: every non-reference chunk is assigned to a batch.
+        try:
+            chunk_key = (0, int(chunk_id))
+        except (TypeError, ValueError):
+            chunk_key = (1, str(chunk_id))
+
+        return page_key + chunk_key
+
+    content_chunks = sorted(content_chunks, key=sort_key)
+
+    partial_summaries = []
+
     for start in range(0, len(content_chunks), SUMMARY_BATCH_SIZE):
-        batch = content_chunks[start:start + SUMMARY_BATCH_SIZE]
-        blocks = []
+        batch = content_chunks[
+            start:start + SUMMARY_BATCH_SIZE
+        ]
+
+        batch_context_parts = []
 
         for chunk in batch:
-            page = chunk.get("page", "Unknown")
-            section = chunk.get("section", "General")
-            text = str(chunk["text"])[:SUMMARY_CHUNK_CHARACTERS]
-            blocks.append(
-                f"[Page {page} | Section: {section}]\n{text}"
+            text = str(chunk.get("text", "")).strip()
+
+            if len(text) > SUMMARY_CHUNK_CHARACTERS:
+                text = (
+                    text[:SUMMARY_CHUNK_CHARACTERS]
+                    .rsplit(" ", 1)[0]
+                    + " ..."
+                )
+
+            batch_context_parts.append(
+                f"[Page {_page_number(chunk)} | "
+                f"Section: {_section(chunk)}]\n{text}"
             )
 
-        prompt = (
-            "Summarize the important information in this batch. "
-            "Include all distinct useful points and their page citations. "
-            "Do not add outside knowledge.\n\n"
-            + "\n\n---\n\n".join(blocks)
+        batch_context = "\n\n---\n\n".join(batch_context_parts)
+
+        system_prompt = (
+            "You are a careful research-paper analyst. Summarize only "
+            "the evidence provided. Do not invent facts, numbers, methods, "
+            "or findings. Preserve important technical details and cite "
+            "supporting page numbers using [Page N]. Distinguish reported "
+            "findings from interpretations. If information is absent, "
+            "say it is not specified in the provided passages."
         )
 
-        intermediate_summaries.append(
-            _call_groq(map_system, prompt, SUMMARY_BATCH_TOKENS)
+        user_prompt = (
+            "Summarize the following section passages into concise notes "
+            "that preserve the research goal, methods, evidence, findings, "
+            "limitations, and conclusions when present. Keep page citations. "
+            "Do not claim this batch represents the entire paper.\n\n"
+            f"{batch_context}"
         )
-        used_chunks.extend(batch)
 
-    # REDUCE: combine all intermediate summaries, using sub-batches if needed.
-    reduce_system = """
-You are a professional research-paper summarizer.
-Combine the supplied partial summaries into one coherent paper summary.
-Remove repetition while retaining distinct information. Use clear headings:
-Overview, Research Goal, Methodology, Main Findings, Limitations, and
-Conclusion when supported by the evidence. Do not invent missing sections.
-Cite claims with the original [Page N] markers supplied in the notes.
-If the evidence does not establish a point, omit it or state that it is unclear.
-""".strip()
+        partial = _call_groq(
+            system_prompt,
+            user_prompt,
+            max_tokens=SUMMARY_BATCH_TOKENS,
+        )
 
-    current_summaries = intermediate_summaries
+        partial_summaries.append(
+            f"Batch covering pages "
+            f"{_page_number(batch[0])}–{_page_number(batch[-1])}:\n"
+            f"{partial}"
+        )
 
-    # Reduce hierarchically so very long papers do not create one huge request.
-    while len(current_summaries) > 4:
+    # Reduce partial summaries in groups to stay within context limits.
+    while len(partial_summaries) > 4:
         reduced = []
 
-        for start in range(0, len(current_summaries), 4):
-            group = current_summaries[start:start + 4]
-            prompt = (
-                "Combine these partial paper summaries into concise notes. "
-                "Preserve distinct claims and original page citations. "
-                "Remove repeated points; do not add facts.\n\n"
+        for start in range(0, len(partial_summaries), 4):
+            group = partial_summaries[start:start + 4]
+
+            system_prompt = (
+                "You combine research notes faithfully. Preserve distinct "
+                "findings, important numerical results, limitations, and "
+                "page citations. Do not add unsupported information."
+            )
+
+            user_prompt = (
+                "Combine these partial summaries into a concise, "
+                "nonredundant set of research notes. Retain page citations "
+                "and contradictions or uncertainty where relevant.\n\n"
                 + "\n\n---\n\n".join(group)
             )
+
             reduced.append(
-                _call_groq(reduce_system, prompt, SUMMARY_BATCH_TOKENS)
+                _call_groq(
+                    system_prompt,
+                    user_prompt,
+                    max_tokens=SUMMARY_BATCH_TOKENS,
+                )
             )
 
-        current_summaries = reduced
+        partial_summaries = reduced
 
-    final_prompt = (
-        "Create the final professional, easy-to-understand summary of the "
-        "whole research paper from these notes. Use the headings Overview, "
-        "Research Goal, Methodology, Main Findings, and Conclusion where "
-        "supported. Include limitations if discussed. Cite claims using "
-        "the original [Page N] markers. Avoid repetition and outside facts. "
-        "Do not say a detail is present if the notes do not support it.\n\n"
-        + "\n\n---\n\n".join(current_summaries)
+    final_system_prompt = (
+        "You are ResearchPilot AI, a precise research assistant. Create "
+        "a professional, readable summary using only the supplied notes. "
+        "Do not fabricate information. Retain page citations for factual "
+        "claims wherever available. If a requested detail is not covered, "
+        "state that it was not specified in the reviewed text."
+    )
+
+    final_user_prompt = (
+        "Write a structured summary of the research paper from these "
+        "notes gathered across its indexed content. Use the headings:\n"
+        "1. Overview\n"
+        "2. Research Problem and Objectives\n"
+        "3. Methodology\n"
+        "4. Main Findings\n"
+        "5. Limitations\n"
+        "6. Conclusion\n\n"
+        "Include only headings supported by the notes. Avoid repetition. "
+        "Do not invent numerical results or claim that absent information "
+        "was reported. Keep page citations.\n\n"
+        + "\n\n---\n\n".join(partial_summaries)
     )
 
     final_summary = _call_groq(
-        reduce_system,
-        final_prompt,
-        SUMMARY_FINAL_TOKENS,
+        final_system_prompt,
+        final_user_prompt,
+        max_tokens=SUMMARY_FINAL_TOKENS,
     )
-    return final_summary, used_chunks
 
+    return final_summary, content_chunks
+
+
+# ---------------------------------------------------------
+# Main public function
+# ---------------------------------------------------------
 
 def answer_question(
-    store,
+    store: Any,
     question: str,
     top_k: int = 5,
 ) -> dict[str, Any]:
     """
-    Backwards-compatible API:
-    answer_question(store, question, top_k=5)
+    Answer a question using the indexed document.
 
-    Always returns:
-      answer: str
-      sources: list[dict]
-      extracted_text: str
+    The returned keys remain compatible with the UI:
+      answer: generated answer or readable error
+      sources: supporting source metadata
+      extracted_text: original retrieved evidence
     """
+
     if not isinstance(question, str) or not question.strip():
-      raise ValueError("Question cannot be empty")
+        raise ValueError("Question cannot be empty")
 
     if (
-    isinstance(top_k, bool)
-    or not isinstance(top_k, int)
-    or top_k < 1
-):
-      raise ValueError("top_k must be a positive integer")
-    if top_k < 1:
-        raise ValueError("top_k must be at least 1.")
+        isinstance(top_k, bool)
+        or not isinstance(top_k, int)
+        or top_k < 1
+    ):
+        raise ValueError("top_k must be a positive integer")
 
     question = question.strip()
+
+    empty_result = {
+        "answer": "",
+        "sources": [],
+        "extracted_text": "",
+    }
+
+    if not GROQ_API_KEY:
+      raise RuntimeError(
+        "GROQ_API_KEY is missing. Add it to your root .env file."
+    )
+
     all_chunks = list(getattr(store, "chunks", []) or [])
 
-    if not all_chunks:
-        return {
-            "answer": "Please upload a research paper before asking a question.",
-            "sources": [],
-            "extracted_text": "",
-        }
+    all_chunks = list(getattr(store, "chunks", []) or [])
 
-    api_key = os.getenv("GROQ_API_KEY")
-    if not api_key:
-        return {
-            "answer": (
-                "GROQ_API_KEY is missing. Configure it in your local .env "
-                "file and restart the app."
-            ),
-            "sources": [],
-            "extracted_text": "",
-        }
-
-    # Whole-paper summaries must process all document chunks, not just top-k.
-    if _classify_question(question) == "summary":
-        try:
-            summary, used_chunks = _whole_document_summary(all_chunks)
-            sources = _format_sources(used_chunks)
-            extracted_text = "\n\n".join(
-                f"[Page {s['page']}]\n{s['text']}" for s in sources
-            )
-            return {
-                "answer": summary,
-                "sources": sources,
-                "extracted_text": extracted_text,
-            }
-        except (
-            httpx.HTTPError, KeyError, IndexError,
-            TypeError, ValueError, RuntimeError,
-        ) as exc:
-            print(f"Whole-paper summarization failed: {type(exc).__name__}: {exc}")
-            return {
-                "answer": (
-                    "I couldn't complete the whole-paper summary. "
-                    "Please try again; your indexed document is still available."
-                ),
-                "sources": [],
-                "extracted_text": "",
-            }
-
-    # Focused questions use retrieval across the complete indexed collection.
-    index = getattr(store, "index", None)
-    index_size = getattr(index, "ntotal", len(all_chunks))
-    candidate_count = min(index_size, max(top_k * 4, 20))
-
-    candidates = store.search(
-        question,
-        top_k=candidate_count,
-        candidate_multiplier=8,
-    )
-    ranked = _rank_candidates(question, candidates)
-    selected = _select_passages(
-        ranked,
-        min(MAX_CONTEXT_PASSAGES, max(top_k, 5)),
-    )
-    sources = _format_sources(selected)
-    extracted_text = "\n\n".join(
-        f"[Page {s['page']}]\n{s['text']}" for s in sources
-    )
-
-    if not sources:
-        return {
-            "answer": (
-                "I couldn't find relevant evidence in the extracted text. "
-                "Please check the PDF extraction or rephrase your question."
-            ),
-            "sources": [],
-            "extracted_text": "",
-        }
-
-    system_prompt = """
-You are a professional research-paper assistant.
-Answer in clear, natural, easy-to-understand wording.
-
-Use only the supplied passages as factual evidence.
-Cite substantive claims using [Page N], based on the source labels.
-Combine evidence from multiple passages when useful.
-Do not invent facts, statistics, methods, results, or conclusions.
-Do not repeat the same idea in multiple sentences.
-Do not reproduce long source passages verbatim.
-If evidence is insufficient, say so clearly.
-Do not mention similarity scores or internal retrieval mechanics.
-""".strip()
-
-    user_prompt = (
-        f"QUESTION:\n{question}\n\n"
-        f"EVIDENCE:\n{_build_context(sources)}\n\n"
-        "Answer the question directly and professionally. Paraphrase the "
-        "evidence, remove repetition, and include page citations."
-    )
+# Some test doubles expose search() without exposing chunks.
+# Allow those stores to answer through their search interface.
+    if not all_chunks and not callable(getattr(store, "search", None)):
+       return {
+        **empty_result,
+        "answer": (
+            "No document is indexed yet. Please upload a readable "
+            "PDF before asking a question."
+        ),
+    }
 
     try:
+        question_type = _classify_question(question)
+
+        # Whole-paper summaries must process the complete indexed content,
+        # not only the most similar top-k passages.
+        if question_type == "summary":
+            summary, used_chunks = _whole_document_summary(all_chunks)
+
+            return {
+                "answer": summary,
+                "sources": _format_sources(used_chunks),
+                "extracted_text": _build_context(
+                    used_chunks,
+                    max_chars=SUMMARY_CHUNK_CHARACTERS,
+                ),
+            }
+
+        # Retrieve a broader candidate set before selecting evidence.
+        index_size = len(all_chunks)
+        candidate_count = (
+    min(index_size, max(top_k * 4, 20))
+    if index_size
+    else max(top_k * 4, 20)
+)
+
+        candidates = store.search(
+            question,
+            top_k=candidate_count,
+        )
+
+        selected = _select_passages(
+            question,
+            candidates,
+            limit=min(max(top_k, 1), MAX_CONTEXT_PASSAGES),
+        )
+
+        if not selected:
+            return {
+                **empty_result,
+                "answer": (
+                    "I could not find sufficiently relevant passages "
+                    "in the indexed document to answer this question."
+                ),
+            }
+
+        context = _build_context(selected)
+
+        system_prompt = (
+            "You are ResearchPilot AI, a research-paper question-answering "
+            "assistant. Answer in clear, professional language using only "
+            "the supplied document evidence. Synthesize the evidence in "
+            "your own words instead of copying long passages. Cite factual "
+            "claims with the provided page markers, such as [Page 2]. "
+            "Never invent facts, results, numbers, quotations, or page "
+            "citations. If the evidence is insufficient, say so clearly. "
+            "If sources disagree, describe the disagreement."
+        )
+
+        user_prompt = (
+            f"Question: {question}\n\n"
+            "Use the following retrieved passages as evidence. Give a "
+            "direct answer first, then explain important supporting details. "
+            "Include page citations for claims. If the passages do not "
+            "answer the question, clearly state the limitation.\n\n"
+            f"Document evidence:\n{context}"
+        )
+
         answer = _call_groq(
             system_prompt,
             user_prompt,
-            MAX_ANSWER_TOKENS,
-        )
-    except (
-        httpx.HTTPError, KeyError, IndexError,
-        TypeError, ValueError, RuntimeError,
-    ) as exc:
-        print(f"Answer generation failed: {type(exc).__name__}: {exc}")
-        answer = (
-            "I couldn't generate an answer right now. The supporting source "
-            "passages are available below."
+            max_tokens=MAX_ANSWER_TOKENS,
         )
 
-    return {
-        "answer": answer,
-        "sources": sources,
-        "extracted_text": extracted_text,
-    }
+        return {
+            "answer": answer,
+            "sources": _format_sources(selected),
+            "extracted_text": context,
+        }
+
+    except Exception as exc:
+        # Keep the UI response structure stable and avoid exposing secrets.
+        message = str(exc).strip() or "An unexpected error occurred."
+
+        return {
+            **empty_result,
+            "answer": f"Unable to generate an answer: {message}",
+        }
