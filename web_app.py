@@ -1,8 +1,9 @@
+
 import html
+import re
 
 import gradio as gr
 
-import re
 from app.ingestion.pdf_parser import extract_text_from_pdf
 from app.ingestion.chunking import chunk_pages
 from app.retrieval.vector_store import FaissVectorStore
@@ -16,7 +17,6 @@ from app.generation.answer_service import answer_question
 CUSTOM_CSS = """
 @import url('https://fonts.googleapis.com/css2?family=Figtree:wght@400;500;600;700&family=Newsreader:opsz,wght@6..72,500;6..72,600;6..72,700&family=JetBrains+Mono:wght@400;500&display=swap');
 
-/* ═════════ Design tokens ═════════ */
 :root {
     --rp-bg: #f4f5fb;
     --rp-card: #ffffff;
@@ -77,48 +77,47 @@ html {
     letter-spacing: -0.3px;
 }
 
-/* ═════════ Keyframes ═════════ */
 @keyframes rp-rise {
     from { opacity: 0; transform: translateY(18px); }
-    to   { opacity: 1; transform: translateY(0); }
+    to { opacity: 1; transform: translateY(0); }
 }
 
 @keyframes rp-fade {
     from { opacity: 0; }
-    to   { opacity: 1; }
+    to { opacity: 1; }
 }
 
 @keyframes rp-drift-a {
     0%, 100% { transform: translate3d(0, 0, 0) scale(1); }
-    50%      { transform: translate3d(-60px, 40px, 0) scale(1.15); }
+    50% { transform: translate3d(-60px, 40px, 0) scale(1.15); }
 }
 
 @keyframes rp-drift-b {
     0%, 100% { transform: translate3d(0, 0, 0) scale(1); }
-    50%      { transform: translate3d(70px, -30px, 0) scale(1.1); }
+    50% { transform: translate3d(70px, -30px, 0) scale(1.1); }
 }
 
 @keyframes rp-float {
     0%, 100% { transform: rotate(2.5deg) translateY(0); }
-    50%      { transform: rotate(1.5deg) translateY(-10px); }
+    50% { transform: rotate(1.5deg) translateY(-10px); }
 }
 
 @keyframes rp-scan {
-    0%   { top: -40px; opacity: 0; }
-    10%  { opacity: 1; }
-    90%  { opacity: 1; }
+    0% { top: -40px; opacity: 0; }
+    10% { opacity: 1; }
+    90% { opacity: 1; }
     100% { top: 100%; opacity: 0; }
 }
 
 @keyframes rp-mark {
-    0%, 18%  { background-size: 0% 100%; }
+    0%, 18% { background-size: 0% 100%; }
     38%, 78% { background-size: 100% 100%; }
-    100%     { background-size: 0% 100%; }
+    100% { background-size: 0% 100%; }
 }
 
 @keyframes rp-pulse {
-    0%   { box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.55); }
-    70%  { box-shadow: 0 0 0 9px rgba(16, 185, 129, 0); }
+    0% { box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.55); }
+    70% { box-shadow: 0 0 0 9px rgba(16, 185, 129, 0); }
     100% { box-shadow: 0 0 0 0 rgba(16, 185, 129, 0); }
 }
 
@@ -127,11 +126,10 @@ html {
 }
 
 @keyframes rp-shimmer {
-    0%   { background-position: -200% 0; }
+    0% { background-position: -200% 0; }
     100% { background-position: 200% 0; }
 }
 
-/* ═════════ Header (the one orchestrated moment) ═════════ */
 #rp-header {
     position: relative;
     border-radius: 28px;
@@ -228,7 +226,6 @@ html {
     animation: rp-rise 0.9s var(--rp-ease) 0.32s both;
 }
 
-/* Animated paper: highlights + scan beam = "finding evidence" */
 .rp-doc {
     position: relative;
     flex: 0 0 auto;
@@ -271,10 +268,10 @@ html {
 .rp-doc .ln.hit.d3 { animation-delay: 3.2s; }
 
 .rp-doc .w100 { width: 100%; }
-.rp-doc .w90  { width: 90%; }
-.rp-doc .w80  { width: 80%; }
-.rp-doc .w70  { width: 70%; }
-.rp-doc .w55  { width: 55%; }
+.rp-doc .w90 { width: 90%; }
+.rp-doc .w80 { width: 80%; }
+.rp-doc .w70 { width: 70%; }
+.rp-doc .w55 { width: 55%; }
 
 .rp-beam {
     position: absolute;
@@ -287,7 +284,6 @@ html {
     pointer-events: none;
 }
 
-/* ═════════ Cards ═════════ */
 .rp-card {
     --block-background-fill: transparent;
     --block-border-width: 0px;
@@ -332,11 +328,10 @@ html {
     transform: scaleX(1);
 }
 
-#rp-card-library  { animation-delay: 0.5s; }
-#rp-card-ask      { animation-delay: 0.62s; }
+#rp-card-library { animation-delay: 0.5s; }
+#rp-card-ask { animation-delay: 0.62s; }
 #rp-card-evidence { animation-delay: 0.74s; }
 
-/* Step heading (these three steps really are a sequence) */
 .rp-step {
     display: flex;
     gap: 16px;
@@ -386,7 +381,6 @@ html {
     margin: 18px 0 8px;
 }
 
-/* ═════════ Buttons ═════════ */
 button {
     font-family: 'Figtree', sans-serif !important;
     font-weight: 600 !important;
@@ -461,7 +455,6 @@ button {
     transform: scale(0.98);
 }
 
-/* ═════════ Inputs ═════════ */
 textarea,
 input[type="text"],
 input[type="number"] {
@@ -488,7 +481,6 @@ input[type="text"]:focus {
     font-size: 13px !important;
 }
 
-/* ═════════ File uploader ═════════ */
 .gradio-container .upload-container,
 .gradio-container .file-upload,
 .gradio-container [data-testid="file-upload"] {
@@ -506,7 +498,6 @@ input[type="text"]:focus {
     transform: scale(1.005);
 }
 
-/* ═════════ Status box ═════════ */
 #rp-status textarea {
     line-height: 1.75 !important;
     font-family: 'JetBrains Mono', monospace !important;
@@ -515,7 +506,6 @@ input[type="text"]:focus {
     border-left: 3px solid var(--rp-ok) !important;
 }
 
-/* ═════════ Answer ═════════ */
 #rp-answer {
     background: var(--rp-card-soft);
     border: 1px solid var(--rp-line);
@@ -558,7 +548,6 @@ input[type="text"]:focus {
 #rp-answer .prose > *:nth-child(4) { animation-delay: 0.24s; }
 #rp-answer .prose > *:nth-child(n+5) { animation-delay: 0.32s; }
 
-/* ═════════ Evidence cards ═════════ */
 .rp-evidence {
     display: flex;
     flex-direction: column;
@@ -666,7 +655,6 @@ input[type="text"]:focus {
     flex: 0 0 auto;
 }
 
-/* ═════════ Gradio progress / loading ═════════ */
 .eta-bar {
     background: linear-gradient(90deg, rgba(99, 102, 241, 0.25), rgba(124, 58, 237, 0.25)) !important;
 }
@@ -675,7 +663,6 @@ input[type="text"]:focus {
     border-color: var(--rp-indigo) !important;
 }
 
-/* ═════════ Footer ═════════ */
 .rp-footer {
     text-align: center;
     padding: 26px 8px 14px;
@@ -688,7 +675,6 @@ footer {
     display: none !important;
 }
 
-/* ═════════ Scrollbar ═════════ */
 ::-webkit-scrollbar { width: 10px; height: 10px; }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb {
@@ -699,7 +685,6 @@ footer {
 }
 ::-webkit-scrollbar-thumb:hover { background-color: var(--rp-indigo); }
 
-/* ═════════ Accessibility ═════════ */
 button:focus-visible,
 textarea:focus-visible,
 input:focus-visible {
@@ -715,7 +700,6 @@ input:focus-visible {
     }
 }
 
-/* ═════════ Responsive ═════════ */
 @media (max-width: 860px) {
     .rp-doc { display: none; }
     #rp-header { padding: 34px 26px; border-radius: 22px; }
@@ -729,6 +713,10 @@ input:focus-visible {
 }
 """
 
+
+# ─────────────────────────────────────────────
+# HTML Components
+# ─────────────────────────────────────────────
 
 HEADER_HTML = """
 <div id="rp-header">
@@ -819,8 +807,17 @@ FOOTER_HTML = """
 ANSWER_PLACEHOLDER = (
     "*Your answer will appear here after you process a paper and ask a question.*"
 )
+
+EMPTY_GROUNDING_HTML = ""
+
+
+# ─────────────────────────────────────────────
+# Evidence Rendering
+# ─────────────────────────────────────────────
+
 def build_sources_html(sources):
     """Render retrieved passages as readable evidence cards."""
+
     cards = []
 
     for index, source in enumerate(sources):
@@ -834,24 +831,27 @@ def build_sources_html(sources):
 
         text = str(source.get("text", "") or "").strip()
 
-        # Normalize whitespace without damaging word boundaries.
         text = text.replace("\r\n", "\n").replace("\r", "\n")
         text = re.sub(r"[ \t]+", " ", text)
         text = re.sub(r"\n{3,}", "\n\n", text).strip()
 
-        # Limit display length, preferring a sentence boundary.
         max_chars = 1200
 
         if len(text) > max_chars:
             clipped = text[:max_chars]
+
             sentence_ends = list(
                 re.finditer(r'[.!?]["\')\]]?(?=\s|$)', clipped)
             )
 
-            if sentence_ends and sentence_ends[-1].end() >= max_chars * 0.5:
+            if (
+                sentence_ends
+                and sentence_ends[-1].end() >= max_chars * 0.5
+            ):
                 text = clipped[:sentence_ends[-1].end()].strip()
             else:
                 last_space = clipped.rfind(" ")
+
                 text = (
                     clipped[:last_space].rstrip()
                     if last_space > 0
@@ -861,7 +861,6 @@ def build_sources_html(sources):
 
         safe_text = html.escape(text).replace("\n", "<br>")
 
-        # Similarity must be supplied by answer_service.py to be meaningful.
         percent = max(0.0, min(1.0, similarity)) * 100
 
         cards.append(
@@ -878,9 +877,11 @@ def build_sources_html(sources):
                         </span>
                     </span>
                 </div>
+
                 <div class="rp-muted" style="margin-bottom:8px">
                     Section: {section}
                 </div>
+
                 <p class="rp-src-text">{safe_text}</p>
             </div>
             """
@@ -889,14 +890,132 @@ def build_sources_html(sources):
     return '<div class="rp-evidence">' + "".join(cards) + "</div>"
 
 
-def process_pdf(pdf_file):
+# ─────────────────────────────────────────────
+# Grounding Status
+# ─────────────────────────────────────────────
+
+def grounding_status_html(status):
+    """Render a safe, readable answer-verification status."""
+
+    status = str(status or "").strip()
+
+    styles = {
+        "Summary generated": (
+            "Summary generated",
+            "#6366f1",
+            "A document-level summary was generated from the paper.",
+        ),
+        "Partially verified": (
+            "Partially verified",
+            "#d97706",
+            "The answer has supporting passages, but it may not cover every detail.",
+        ),
+        "Withheld": (
+            "Answer withheld",
+            "#dc2626",
+            "The available evidence was insufficient to provide a reliable answer.",
+        ),
+        "No evidence": (
+            "No evidence",
+            "#64748b",
+            "No supporting passages were available for this question.",
+        ),
+    }
+
+    label, color, description = styles.get(
+        status,
+        (
+            "Status unavailable",
+            "#64748b",
+            "Verification information is unavailable.",
+        ),
+    )
+
+    return f"""
+    <div style="
+        display:flex;
+        flex-wrap:wrap;
+        align-items:center;
+        gap:10px;
+        padding:10px 14px;
+        margin:4px 0 12px;
+        border:1px solid var(--rp-line);
+        border-radius:12px;
+        background:var(--rp-card-soft);
+        font-family:'Figtree',sans-serif;
+    ">
+        <span style="
+            width:9px;
+            height:9px;
+            border-radius:50%;
+            background:{color};
+            flex-shrink:0;
+        "></span>
+
+        <strong style="color:{color};font-size:13px;">
+            {html.escape(label)}
+        </strong>
+
+        <span style="
+            color:var(--rp-muted);
+            font-size:12px;
+        ">
+            {html.escape(description)}
+        </span>
+    </div>
+    """
+
+
+# ─────────────────────────────────────────────
+# Document Processing
+# ─────────────────────────────────────────────
+
+def invalidate_document(pdf_file):
+    """
+    Clear the previously processed document when a new PDF is selected.
+    """
+
     if pdf_file is None:
-        return None, "Please upload a research paper first."
+        message = "Waiting for a research paper..."
+    else:
+        message = (
+            "New PDF selected.\n\n"
+            "Click Process paper to index this document before asking questions."
+        )
+
+    return (
+        None,
+        message,
+        ANSWER_PLACEHOLDER,
+        EMPTY_SOURCES_HTML,
+        EMPTY_GROUNDING_HTML,
+    )
+
+
+def process_pdf(pdf_file):
+    """Extract, chunk, and index the selected research paper."""
+
+    if pdf_file is None:
+        return (
+            None,
+            "Please upload a research paper first.",
+            ANSWER_PLACEHOLDER,
+            EMPTY_SOURCES_HTML,
+            EMPTY_GROUNDING_HTML,
+        )
 
     try:
         pages = extract_text_from_pdf(pdf_file)
 
-        # Research-focused chunking settings
+        if not pages:
+            return (
+                None,
+                "No readable pages were extracted from this PDF.",
+                ANSWER_PLACEHOLDER,
+                EMPTY_SOURCES_HTML,
+                EMPTY_GROUNDING_HTML,
+            )
+
         chunks = chunk_pages(
             pages,
             chunk_size=1200,
@@ -904,7 +1023,13 @@ def process_pdf(pdf_file):
         )
 
         if not chunks:
-            return None, "No usable text chunks were found in this PDF."
+            return (
+                None,
+                "No usable text chunks were found in this PDF.",
+                ANSWER_PLACEHOLDER,
+                EMPTY_SOURCES_HTML,
+                EMPTY_GROUNDING_HTML,
+            )
 
         store = FaissVectorStore()
         store.add_chunks(chunks)
@@ -916,26 +1041,47 @@ def process_pdf(pdf_file):
             "Your paper is ready for questions."
         )
 
-        return store, status
+        return (
+            store,
+            status,
+            ANSWER_PLACEHOLDER,
+            EMPTY_SOURCES_HTML,
+            EMPTY_GROUNDING_HTML,
+        )
 
     except Exception as exc:
-        return None, f"Could not process the PDF: {exc}"
+        return (
+            None,
+            f"Could not process the PDF: {exc}",
+            ANSWER_PLACEHOLDER,
+            EMPTY_SOURCES_HTML,
+            EMPTY_GROUNDING_HTML,
+        )
+
+
+# ─────────────────────────────────────────────
+# Question Answering
+# ─────────────────────────────────────────────
+
 def ask_question(question, store):
+    """Generate an answer and display its supporting evidence."""
+
     if store is None:
         return (
             "### Upload a paper first\n"
             "Upload your research PDF and select **Process paper**.",
             EMPTY_SOURCES_HTML,
+            EMPTY_GROUNDING_HTML,
         )
 
     if not question or not question.strip():
         return (
             "Please enter a research question.",
             EMPTY_SOURCES_HTML,
+            EMPTY_GROUNDING_HTML,
         )
 
     try:
-        # Correct argument order: question first, store second
         result = answer_question(
             question.strip(),
             store,
@@ -944,27 +1090,48 @@ def ask_question(question, store):
 
         answer = result.get("answer") or "No answer was returned."
         sources = result.get("sources", [])
+        grounding_status = result.get(
+            "grounding_status",
+            "No evidence",
+        )
 
         if sources:
             source_html = build_sources_html(sources)
         else:
-            source_html = (
-                '<div class="rp-empty"><div>'
-                "No supporting passages were returned. "
-                "Try rephrasing your question."
-                "</div></div>"
-            )
+            source_html = """
+            <div class="rp-empty">
+                <div>
+                    No supporting passages were returned.
+                    Try rephrasing your question.
+                </div>
+            </div>
+            """
 
-        return answer, source_html
+        status_html = grounding_status_html(grounding_status)
+
+        return answer, source_html, status_html
 
     except Exception as exc:
         return (
             f"**Something went wrong:** {html.escape(str(exc))}",
             EMPTY_SOURCES_HTML,
+            EMPTY_GROUNDING_HTML,
         )
-    
+
+
+# ─────────────────────────────────────────────
+# Clear Results
+# ─────────────────────────────────────────────
+
 def clear_question():
-    return "", ANSWER_PLACEHOLDER, EMPTY_SOURCES_HTML
+    """Clear the question, answer, evidence, and verification status."""
+
+    return (
+        "",
+        ANSWER_PLACEHOLDER,
+        EMPTY_SOURCES_HTML,
+        EMPTY_GROUNDING_HTML,
+    )
 
 
 # ─────────────────────────────────────────────
@@ -991,7 +1158,11 @@ with gr.Blocks(
 
         # LEFT: Document workspace
         with gr.Column(scale=4, min_width=280):
-            with gr.Group(elem_classes=["rp-card"], elem_id="rp-card-library"):
+
+            with gr.Group(
+                elem_classes=["rp-card"],
+                elem_id="rp-card-library",
+            ):
                 gr.HTML(LIBRARY_HTML)
 
                 pdf_input = gr.File(
@@ -1016,23 +1187,27 @@ with gr.Blocks(
 
         # RIGHT: Research Q&A
         with gr.Column(scale=7, min_width=300):
-            with gr.Group(elem_classes=["rp-card"], elem_id="rp-card-ask"):
+
+            with gr.Group(
+                elem_classes=["rp-card"],
+                elem_id="rp-card-ask",
+            ):
                 gr.HTML(ASK_HTML)
 
                 question_input = gr.Textbox(
                     label="Your research question",
-                    placeholder=(
-                        "Example: What methodology does this paper use?"
-                    ),
+                    placeholder="Example: What methodology does this paper use?",
                     lines=3,
                 )
 
                 with gr.Row():
+
                     ask_button = gr.Button(
                         "Get answer",
                         variant="primary",
                         elem_id="rp-ask-btn",
                     )
+
                     clear_button = gr.Button(
                         "Clear",
                         variant="secondary",
@@ -1040,44 +1215,96 @@ with gr.Blocks(
 
                 gr.HTML('<div class="rp-sub">Answer</div>')
 
+                grounding_output = gr.HTML(
+                    value=EMPTY_GROUNDING_HTML,
+                )
+
                 answer_output = gr.Markdown(
                     value=ANSWER_PLACEHOLDER,
                     elem_id="rp-answer",
                 )
 
     # Evidence area
-    with gr.Group(elem_classes=["rp-card"], elem_id="rp-card-evidence"):
+    with gr.Group(
+        elem_classes=["rp-card"],
+        elem_id="rp-card-evidence",
+    ):
         gr.HTML(EVIDENCE_HTML)
 
-        sources_output = gr.HTML(value=EMPTY_SOURCES_HTML)
+        sources_output = gr.HTML(
+            value=EMPTY_SOURCES_HTML,
+        )
 
     gr.HTML(FOOTER_HTML)
 
-    # Actions
+    # ─────────────────────────────────────────
+    # Event Handlers
+    # ─────────────────────────────────────────
+
+    # Clear the previous index and results when a new PDF is selected.
+    pdf_input.change(
+        fn=invalidate_document,
+        inputs=[pdf_input],
+        outputs=[
+            document_store,
+            status_output,
+            answer_output,
+            sources_output,
+            grounding_output,
+        ],
+    )
+
+    # Process the selected PDF.
     process_button.click(
         fn=process_pdf,
         inputs=[pdf_input],
-        outputs=[document_store, status_output],
+        outputs=[
+            document_store,
+            status_output,
+            answer_output,
+            sources_output,
+            grounding_output,
+        ],
     )
 
+    # Ask a question using the processed document.
     ask_button.click(
         fn=ask_question,
         inputs=[question_input, document_store],
-        outputs=[answer_output, sources_output],
+        outputs=[
+            answer_output,
+            sources_output,
+            grounding_output,
+        ],
     )
 
+    # Allow Enter to submit a question.
     question_input.submit(
         fn=ask_question,
         inputs=[question_input, document_store],
-        outputs=[answer_output, sources_output],
+        outputs=[
+            answer_output,
+            sources_output,
+            grounding_output,
+        ],
     )
 
+    # Clear question and displayed results.
     clear_button.click(
         fn=clear_question,
         inputs=[],
-        outputs=[question_input, answer_output, sources_output],
+        outputs=[
+            question_input,
+            answer_output,
+            sources_output,
+            grounding_output,
+        ],
     )
 
+
+# ─────────────────────────────────────────────
+# Launch Application
+# ─────────────────────────────────────────────
 
 if __name__ == "__main__":
     demo.launch()
