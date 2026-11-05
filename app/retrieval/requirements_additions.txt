@@ -1,0 +1,2 @@
+sentence-transformers>=2.7   # cross-encoder reranker (pulls in torch)
+tiktoken>=0.7                # optional: accurate token counts (falls back to chars/3.5)

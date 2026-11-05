@@ -1,0 +1,8 @@
+[
+  {"id": "q1", "question": "What dataset was used for evaluation?", "answerable": true,
+   "gold_pages": [5], "gold_phrases": ["dataset"], "gold_keywords": ["dataset"],
+   "reference_answer": "Short reference answer written by you from the paper."},
+  {"id": "q2", "question": "What are the main limitations?", "answerable": true,
+   "gold_pages": [9, 10], "gold_keywords": ["limitation"]},
+  {"id": "q3", "question": "Which GPU model was used for training?", "answerable": false}
+]
