@@ -1,6 +1,6 @@
-
-import re
+import logging
 import math
+import re
 from collections import Counter
 from typing import Any
 
@@ -8,7 +8,9 @@ import faiss
 import numpy as np
 
 from app.retrieval.embeddings import embed_texts
+from app.retrieval.reranker import get_reranker
 
+logger = logging.getLogger(__name__)
 
 STOP_WORDS = {
     "a", "an", "the", "is", "are", "was", "were", "be", "been",
@@ -28,20 +30,44 @@ REFERENCE_HEADINGS = {
     "selected references",
 }
 
+REFERENCE_PENALTY = 0.35
+RRF_K = 60
+
+
+def _stem(word: str) -> str:
+    """Very light suffix stripping so 'trained'/'training'/'trains' match."""
+    for suffix in ("ations", "ation", "ings", "ing", "edly", "ed", "es", "s"):
+        if len(word) > len(suffix) + 3 and word.endswith(suffix):
+            return word[: -len(suffix)]
+    return word
+
 
 def tokenize(text: str) -> list[str]:
-    """Tokenize text while preserving useful technical terms."""
+    """
+    Tokenize for BM25.
+
+    Hyphenated terms are indexed BOTH whole and split, so the query
+    "self attention" matches "self-attention" and vice versa.
+    """
 
     words = re.findall(
         r"[a-zA-Z0-9]+(?:[-'][a-zA-Z0-9]+)*",
         str(text).lower(),
     )
 
-    return [
-        word
-        for word in words
-        if len(word) > 1 and word not in STOP_WORDS
-    ]
+    tokens: list[str] = []
+
+    for word in words:
+        parts = [word]
+
+        if "-" in word or "'" in word:
+            parts += [p for p in re.split(r"[-']", word) if p]
+
+        for part in parts:
+            if len(part) > 1 and part not in STOP_WORDS:
+                tokens.append(_stem(part))
+
+    return tokens
 
 
 def is_reference_chunk(chunk: dict[str, Any]) -> bool:
@@ -54,21 +80,13 @@ def is_reference_chunk(chunk: dict[str, Any]) -> bool:
 
     text = str(chunk.get("text", ""))
 
-    lines = [
-        line.strip()
-        for line in text.splitlines()
-        if line.strip()
-    ]
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
 
     if not lines:
         return False
 
     for line in lines[:3]:
-        normalized = re.sub(
-            r"[^a-z ]",
-            "",
-            line.lower(),
-        ).strip()
+        normalized = re.sub(r"[^a-z ]", "", line.lower()).strip()
 
         if normalized in REFERENCE_HEADINGS:
             return True
@@ -76,9 +94,7 @@ def is_reference_chunk(chunk: dict[str, Any]) -> bool:
     citation_count = 0
 
     for line in lines:
-        has_year = bool(
-            re.search(r"\b(?:19|20)\d{2}[a-z]?\b", line)
-        )
+        has_year = bool(re.search(r"\b(?:19|20)\d{2}[a-z]?\b", line))
 
         has_cue = bool(
             re.search(
@@ -99,19 +115,35 @@ def is_reference_chunk(chunk: dict[str, Any]) -> bool:
     )
 
 
+def _embedding_text(chunk: dict[str, Any]) -> str:
+    """Prefix the section heading so 'methodology' questions can match it."""
+    section = str(chunk.get("section", "") or "").strip()
+    text = chunk["text"]
+
+    if section and section.lower() not in {"unknown", "none"}:
+        return f"{section}\n{text}"
+
+    return text
+
+
 class FaissVectorStore:
     """
-    Hybrid document retrieval using:
+    Hybrid retrieval + optional cross-encoder reranking.
 
-    1. FAISS IndexFlatIP for semantic retrieval.
-    2. BM25 for keyword retrieval.
-    3. Combined scoring for final ranking.
+    search():
+        FAISS cosine + BM25, fused with Reciprocal Rank Fusion (RRF).
+        RRF is used for ORDERING because it needs no score calibration.
 
-    Embeddings are normalized, so inner product represents
-    cosine similarity.
+        Each result also carries ABSOLUTE signals for gating:
+            semantic_similarity  raw cosine
+            query_term_coverage  fraction of query terms present
+            similarity           0.7 * max(cosine, 0) + 0.3 * coverage
+
+    rerank():
+        Cross-encoder second stage. Adds reranker_score (probability).
     """
 
-    def __init__(self):
+    def __init__(self, reranker=None):
         self.index = None
         self.chunks: list[dict[str, Any]] = []
 
@@ -123,33 +155,26 @@ class FaissVectorStore:
         self.dimension: int | None = None
 
         self.reference_flags: list[bool] = []
+        self._reranker = reranker
 
     # -----------------------------------------------------
     # Index construction
     # -----------------------------------------------------
 
     def add_chunks(self, chunks: list[dict[str, Any]]) -> None:
-        """Build and replace the active document index."""
-
         if not isinstance(chunks, list) or not chunks:
-            raise ValueError(
-                "chunks must be a non-empty list."
-            )
+            raise ValueError("chunks must be a non-empty list.")
 
         validated = []
 
         for i, chunk in enumerate(chunks):
             if not isinstance(chunk, dict):
-                raise ValueError(
-                    f"Chunk {i} must be a dictionary."
-                )
+                raise ValueError(f"Chunk {i} must be a dictionary.")
 
             text = chunk.get("text")
 
             if not isinstance(text, str) or not text.strip():
-                raise ValueError(
-                    f"Chunk {i} has empty text."
-                )
+                raise ValueError(f"Chunk {i} has empty text.")
 
             item = dict(chunk)
             item.setdefault("chunk_id", i)
@@ -157,77 +182,47 @@ class FaissVectorStore:
 
             validated.append(item)
 
-        # Generate document embeddings.
         vectors = np.asarray(
-            embed_texts(
-                [chunk["text"] for chunk in validated]
-            ),
+            embed_texts([_embedding_text(c) for c in validated]),
             dtype=np.float32,
         )
 
         if vectors.ndim != 2:
-            raise ValueError(
-                "Embeddings must be a two-dimensional array."
-            )
+            raise ValueError("Embeddings must be a two-dimensional array.")
 
         if vectors.shape[0] != len(validated):
-            raise ValueError(
-                "Embedding count does not match chunk count."
-            )
+            raise ValueError("Embedding count does not match chunk count.")
 
         if vectors.shape[1] == 0:
-            raise ValueError(
-                "Embedding dimension cannot be zero."
-            )
+            raise ValueError("Embedding dimension cannot be zero.")
 
         if not np.isfinite(vectors).all():
-            raise ValueError(
-                "Embeddings contain invalid numerical values."
-            )
+            raise ValueError("Embeddings contain invalid numerical values.")
 
-        # Reject zero vectors instead of silently accepting them.
         norms = np.linalg.norm(vectors, axis=1)
 
         if np.any(norms <= 1e-12):
-            raise ValueError(
-                "One or more document embeddings are zero vectors."
-            )
+            raise ValueError("One or more document embeddings are zero vectors.")
 
         faiss.normalize_L2(vectors)
 
         dimension = vectors.shape[1]
 
-        # Build FAISS index.
         new_index = faiss.IndexFlatIP(dimension)
         new_index.add(vectors)
 
-        # Prepare BM25 metadata.
-        tokenized_chunks = [
-            tokenize(chunk["text"])
-            for chunk in validated
-        ]
+        tokenized_chunks = [tokenize(c["text"]) for c in validated]
 
-        document_frequencies = Counter()
+        document_frequencies: Counter = Counter()
 
         for tokens in tokenized_chunks:
             document_frequencies.update(set(tokens))
 
-        lengths = [
-            len(tokens)
-            for tokens in tokenized_chunks
-        ]
+        lengths = [len(tokens) for tokens in tokenized_chunks]
+        average_length = sum(lengths) / len(lengths) if lengths else 0.0
 
-        average_length = (
-            sum(lengths) / len(lengths)
-            if lengths else 0.0
-        )
+        reference_flags = [is_reference_chunk(c) for c in validated]
 
-        reference_flags = [
-            is_reference_chunk(chunk)
-            for chunk in validated
-        ]
-
-        # Replace the active index only after all operations succeed.
         self.index = new_index
         self.vectors = vectors
         self.chunks = validated
@@ -238,30 +233,18 @@ class FaissVectorStore:
         self.reference_flags = reference_flags
 
     # -----------------------------------------------------
-    # BM25
+    # BM25 (raw scores; callers decide how to use them)
     # -----------------------------------------------------
 
-    def _bm25_scores(
-        self,
-        query_tokens: list[str],
-    ) -> np.ndarray:
-        """Calculate normalized BM25 scores for all chunks."""
-
+    def _bm25_scores(self, query_tokens: list[str]) -> np.ndarray:
         count = len(self.chunks)
-
-        scores = np.zeros(
-            count,
-            dtype=np.float32,
-        )
+        scores = np.zeros(count, dtype=np.float32)
 
         if not query_tokens or count == 0:
             return scores
 
-        k1 = 1.5
-        b = 0.75
-
+        k1, b = 1.5, 0.75
         average_length = max(self.average_length, 1.0)
-
         unique_query_terms = set(query_tokens)
 
         for i, tokens in enumerate(self.tokenized_chunks):
@@ -270,7 +253,6 @@ class FaissVectorStore:
 
             frequencies = Counter(tokens)
             document_length = len(tokens)
-
             score = 0.0
 
             for term in unique_query_terms:
@@ -279,38 +261,21 @@ class FaissVectorStore:
                 if term_frequency == 0:
                     continue
 
-                document_frequency = (
-                    self.document_frequencies.get(term, 0)
-                )
+                document_frequency = self.document_frequencies.get(term, 0)
 
                 idf = math.log(
                     1.0
-                    + (
-                        count - document_frequency + 0.5
-                    ) / (
-                        document_frequency + 0.5
-                    )
+                    + (count - document_frequency + 0.5)
+                    / (document_frequency + 0.5)
                 )
 
                 denominator = term_frequency + k1 * (
-                    1.0
-                    - b
-                    + b * document_length / average_length
+                    1.0 - b + b * document_length / average_length
                 )
 
-                score += (
-                    idf
-                    * term_frequency
-                    * (k1 + 1.0)
-                    / denominator
-                )
+                score += idf * term_frequency * (k1 + 1.0) / denominator
 
             scores[i] = score
-
-        maximum = float(scores.max())
-
-        if maximum > 0:
-            scores /= maximum
 
         return scores
 
@@ -320,47 +285,29 @@ class FaissVectorStore:
 
     @staticmethod
     def _validate_search_arguments(
-        query: str,
-        top_k: int,
-        candidate_multiplier: int,
-        min_similarity: float | None,
+        query, top_k, candidate_multiplier, min_similarity
     ) -> None:
-
         if not isinstance(query, str) or not query.strip():
-            raise ValueError(
-                "query must be a non-empty string."
-            )
+            raise ValueError("query must be a non-empty string.")
 
-        if (
-            isinstance(top_k, bool)
-            or not isinstance(top_k, int)
-            or top_k < 1
-        ):
-            raise ValueError(
-                "top_k must be a positive integer."
-            )
+        if isinstance(top_k, bool) or not isinstance(top_k, int) or top_k < 1:
+            raise ValueError("top_k must be a positive integer.")
 
         if (
             isinstance(candidate_multiplier, bool)
             or not isinstance(candidate_multiplier, int)
             or candidate_multiplier < 1
         ):
-            raise ValueError(
-                "candidate_multiplier must be a positive integer."
-            )
+            raise ValueError("candidate_multiplier must be a positive integer.")
 
         if min_similarity is not None:
             try:
-                min_similarity = float(min_similarity)
+                value = float(min_similarity)
             except (TypeError, ValueError) as exc:
-                raise ValueError(
-                    "min_similarity must be a valid number."
-                ) from exc
+                raise ValueError("min_similarity must be a valid number.") from exc
 
-            if not math.isfinite(min_similarity):
-                raise ValueError(
-                    "min_similarity must be finite."
-                )
+            if not math.isfinite(value):
+                raise ValueError("min_similarity must be finite.")
 
     # -----------------------------------------------------
     # Search
@@ -373,221 +320,123 @@ class FaissVectorStore:
         min_similarity: float | None = None,
         candidate_multiplier: int = 5,
     ) -> list[dict[str, Any]]:
-        """
-        Retrieve relevant passages using FAISS + BM25.
-
-        Returns:
-            List of chunks containing:
-                similarity
-                semantic_similarity
-                keyword_score
-                query_term_coverage
-                is_reference
-        """
-
         self._validate_search_arguments(
-            query,
-            top_k,
-            candidate_multiplier,
-            min_similarity,
+            query, top_k, candidate_multiplier, min_similarity
         )
 
-        if (
-            self.index is None
-            or self.vectors is None
-            or not self.chunks
-        ):
+        if self.index is None or self.vectors is None or not self.chunks:
             return []
 
         query = query.strip()
         chunk_count = len(self.chunks)
 
-        # -------------------------------------------------
-        # 1. Embed query
-        # -------------------------------------------------
-
-        query_vector = np.asarray(
-            embed_texts([query]),
-            dtype=np.float32,
-        )
+        # 1. Embed query ------------------------------------------------
+        query_vector = np.asarray(embed_texts([query]), dtype=np.float32)
 
         if (
             query_vector.ndim != 2
             or query_vector.shape[0] != 1
             or query_vector.shape[1] != self.dimension
         ):
-            raise ValueError(
-                "Query embedding dimensions do not match the index."
-            )
+            raise ValueError("Query embedding dimensions do not match the index.")
 
         if not np.isfinite(query_vector).all():
-            raise ValueError(
-                "Query embedding contains invalid numerical values."
-            )
+            raise ValueError("Query embedding contains invalid numerical values.")
 
         if np.linalg.norm(query_vector) <= 1e-12:
-            raise ValueError(
-                "Query embedding is a zero vector."
-            )
+            raise ValueError("Query embedding is a zero vector.")
 
         faiss.normalize_L2(query_vector)
 
-        # -------------------------------------------------
-        # 2. FAISS semantic retrieval
-        # -------------------------------------------------
+        # 2. Candidate generation ---------------------------------------
+        candidate_count = min(chunk_count, max(top_k * candidate_multiplier, 20))
 
-        candidate_count = min(
-            chunk_count,
-            max(top_k * candidate_multiplier, 20),
-        )
+        _, semantic_indices = self.index.search(query_vector, candidate_count)
 
-        semantic_scores, semantic_indices = self.index.search(
-            query_vector,
-            candidate_count,
-        )
-
-        semantic_candidates = {}
-
-        for score, position in zip(
-            semantic_scores[0],
-            semantic_indices[0],
-        ):
-            if position < 0:
-                continue
-
-            semantic_candidates[int(position)] = float(score)
-
-        # -------------------------------------------------
-        # 3. BM25 keyword retrieval
-        # -------------------------------------------------
+        candidates = {int(p) for p in semantic_indices[0] if p >= 0}
 
         query_tokens = tokenize(query)
+        bm25_raw = self._bm25_scores(query_tokens)
 
-        bm25_scores = self._bm25_scores(query_tokens)
+        for position in np.argsort(bm25_raw)[::-1][:candidate_count]:
+            if bm25_raw[int(position)] > 0:
+                candidates.add(int(position))
 
-        keyword_indices = np.argsort(
-            bm25_scores
-        )[::-1][:candidate_count]
-
-        candidate_indices = set(
-            semantic_candidates.keys()
-        )
-
-        for position in keyword_indices:
-            position = int(position)
-
-            if bm25_scores[position] > 0:
-                candidate_indices.add(position)
-
-        if not candidate_indices:
+        if not candidates:
             return []
 
-        # -------------------------------------------------
-        # 4. Hybrid scoring
-        # -------------------------------------------------
+        # 3. Absolute signals for every candidate -----------------------
+        semantic = {
+            p: float(np.dot(self.vectors[p], query_vector[0])) for p in candidates
+        }
 
+        max_bm25 = float(bm25_raw.max()) if bm25_raw.size else 0.0
         query_terms = set(query_tokens)
+
+        # 4. Reciprocal Rank Fusion for ordering ------------------------
+        sem_order = sorted(candidates, key=lambda p: semantic[p], reverse=True)
+        sem_rank = {p: i + 1 for i, p in enumerate(sem_order)}
+
+        lex_order = sorted(
+            (p for p in candidates if bm25_raw[p] > 0),
+            key=lambda p: float(bm25_raw[p]),
+            reverse=True,
+        )
+        lex_rank = {p: i + 1 for i, p in enumerate(lex_order)}
+
         results = []
 
-        for position in candidate_indices:
+        for position in candidates:
             chunk = self.chunks[position]
 
-            semantic = semantic_candidates.get(position)
-
-            # Calculate exact cosine similarity for BM25-only results.
-            if semantic is None:
-                semantic = float(
-                    np.dot(
-                        self.vectors[position],
-                        query_vector[0],
-                    )
-                )
-
-            lexical = float(bm25_scores[position])
-
-            # Map cosine similarity [-1, 1] to [0, 1].
-            semantic_normalized = (
-                semantic + 1.0
-            ) / 2.0
-
-            combined = (
-                0.65 * semantic_normalized
-                + 0.35 * lexical
-            )
-
-            text_tokens = set(
-                self.tokenized_chunks[position]
-            )
-
             coverage = (
-                len(query_terms & text_tokens) / len(query_terms)
-                if query_terms else 0.0
+                len(query_terms & set(self.tokenized_chunks[position]))
+                / len(query_terms)
+                if query_terms
+                else 0.0
             )
 
             is_reference = self.reference_flags[position]
 
-            # Keep references available, but rank them lower.
+            rrf = 1.0 / (RRF_K + sem_rank[position])
+            if position in lex_rank:
+                rrf += 1.0 / (RRF_K + lex_rank[position])
+
+            similarity = 0.7 * max(semantic[position], 0.0) + 0.3 * coverage
+
             if is_reference:
-                combined -= 0.35
+                rrf *= 0.3
+                similarity -= REFERENCE_PENALTY
 
             item = dict(chunk)
-
-            item["similarity"] = round(
-                float(combined), 4
-            )
-
-            item["semantic_similarity"] = round(
-                float(semantic), 4
-            )
-
+            item["similarity"] = round(similarity, 4)
+            item["rrf_score"] = round(rrf, 6)
+            item["semantic_similarity"] = round(semantic[position], 4)
             item["keyword_score"] = round(
-                lexical, 4
+                float(bm25_raw[position]) / max_bm25 if max_bm25 > 0 else 0.0, 4
             )
-
-            item["query_term_coverage"] = round(
-                coverage, 4
-            )
-
+            item["query_term_coverage"] = round(coverage, 4)
             item["is_reference"] = is_reference
 
             results.append(item)
 
-        # -------------------------------------------------
-        # 5. Ranking
-        # -------------------------------------------------
-
         results.sort(
-            key=lambda item: (
-                item["similarity"],
-                item["query_term_coverage"],
-                item["semantic_similarity"],
-            ),
+            key=lambda item: (item["rrf_score"], item["similarity"]),
             reverse=True,
         )
 
-        # -------------------------------------------------
-        # 6. Deduplication and threshold
-        # -------------------------------------------------
-
-        unique = []
-        seen = set()
+        # 5. Deduplicate + threshold ------------------------------------
+        unique, seen = [], set()
 
         for item in results:
-            normalized = re.sub(
-                r"\W+",
-                " ",
-                item["text"].lower(),
-            ).strip()
+            normalized = re.sub(r"\W+", " ", item["text"].lower()).strip()
 
             if not normalized or normalized in seen:
                 continue
 
             seen.add(normalized)
 
-            if (
-                min_similarity is not None
-                and item["similarity"] < min_similarity
-            ):
+            if min_similarity is not None and item["similarity"] < min_similarity:
                 continue
 
             unique.append(item)
@@ -596,3 +445,56 @@ class FaissVectorStore:
                 break
 
         return unique
+
+    # -----------------------------------------------------
+    # Cross-encoder reranking
+    # -----------------------------------------------------
+
+    def rerank(
+        self,
+        query: str,
+        candidates: list[dict[str, Any]],
+        top_k: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """
+        Re-score candidates with a cross-encoder.
+
+        Adds: reranker_score (0-1), final_score, reranker_used.
+        If the model is unavailable, candidates are returned unchanged with
+        reranker_used=False (the failure is logged, never silent).
+        """
+
+        if not candidates:
+            return []
+
+        top_k = top_k or len(candidates)
+        reranker = self._reranker or get_reranker()
+
+        try:
+            scores = reranker.score(query, [c["text"] for c in candidates])
+        except Exception as exc:
+            logger.warning("Reranking skipped: %s", exc)
+            return [dict(c, reranker_used=False) for c in candidates[:top_k]]
+
+        reranked = []
+
+        for candidate, score in zip(candidates, scores):
+            item = dict(candidate)
+
+            # The cross-encoder dominates; the first-stage signal breaks ties.
+            final = 0.8 * score + 0.2 * float(candidate.get("similarity", 0.0))
+
+            if candidate.get("is_reference"):
+                final -= REFERENCE_PENALTY
+
+            item["reranker_score"] = round(float(score), 4)
+            item["final_score"] = round(final, 4)
+            item["reranker_used"] = True
+
+            reranked.append(item)
+
+        reranked.sort(
+            key=lambda i: (i["final_score"], i["reranker_score"]), reverse=True
+        )
+
+        return reranked[:top_k]
