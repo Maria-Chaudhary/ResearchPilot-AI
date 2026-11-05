@@ -41,10 +41,11 @@ def evaluate_citations(
     cited_pages = {
         int(page)
         for page in re.findall(
-            r"\[Page\s+(\d+)\]",
-            answer,
-            flags=re.IGNORECASE,
-        )
+    r"\[\s*Page[\s\u00A0\u202F]+(\d+)\s*\]",
+    answer,
+    flags=re.IGNORECASE,
+)
+
     }
     expected = {int(page) for page in expected_pages}
     matched_pages = cited_pages & expected

@@ -1,0 +1,14 @@
+
+fastapi
+uvicorn[standard]
+gradio
+pydantic
+pydantic-settings
+python-dotenv
+python-multipart
+httpx
+PyMuPDF
+sentence-transformers
+faiss-cpu
+numpy
+pytest
