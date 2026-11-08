@@ -38,6 +38,11 @@ SUMMARY_CHUNK_TOKENS = 600
 SUMMARY_INPUT_TOKENS = 3200
 SUMMARY_BATCH_TOKENS = 650
 SUMMARY_FINAL_TOKENS = 1100
+SUMMARY_SHORT_TOKENS = 450
+
+# Evidence cards shown to the user (the LLM may still read more passages).
+DISPLAY_EVIDENCE_PASSAGES = int(os.getenv("RAG_DISPLAY_EVIDENCE", "2"))
+EVIDENCE_DISPLAY_CHARS = 900
 SUMMARY_CALL_DELAY = float(os.getenv("RAG_SUMMARY_CALL_DELAY", "0.5"))
 SUMMARY_FOCUS_QUERY = "objective method dataset results findings limitations conclusion"
 
@@ -48,10 +53,28 @@ MAX_CONTINUATIONS = 2
 # --- evidence gate (deliberately lenient: the LLM + validator decide) ---
 # Tune these with app/evaluation/rag_eval.py, do not guess.
 MIN_RERANK_SCORE = float(os.getenv("RAG_MIN_RERANK_SCORE", "0.05"))
-MIN_SEMANTIC_SIMILARITY = float(os.getenv("RAG_MIN_SEMANTIC", "0.30"))
-MIN_QUERY_COVERAGE = float(os.getenv("RAG_MIN_COVERAGE", "0.34"))
+MIN_SEMANTIC_SIMILARITY = float(os.getenv("RAG_MIN_SEMANTIC", "0.12"))
+MIN_QUERY_COVERAGE = float(os.getenv("RAG_MIN_COVERAGE", "0.20"))
 
 INSUFFICIENT_EVIDENCE = "INSUFFICIENT_EVIDENCE"
+
+# Status strings returned in result["grounding_status"]. The defaults are the
+# four values the original UI already recognises; a status the UI does not
+# know is shown as "Status unavailable". The richer label ("Verified" /
+# "Partially verified") is in result["grounding_detail"]["label"].
+STATUS_ANSWERED = os.getenv("RAG_STATUS_ANSWERED", "Partially verified")
+STATUS_ABSTAINED = os.getenv("RAG_STATUS_ABSTAINED", "No evidence")
+STATUS_WITHHELD = os.getenv("RAG_STATUS_WITHHELD", "Withheld")
+STATUS_SUMMARY = os.getenv("RAG_STATUS_SUMMARY", "Summary generated")
+STATUS_ERROR = os.getenv("RAG_STATUS_ERROR", "No evidence")
+
+# PowerShell:  $env:RAG_DEBUG="1"; python web_app.py
+DEBUG = os.getenv("RAG_DEBUG", "0") == "1"
+
+
+def _debug(*parts: Any) -> None:
+    if DEBUG:
+        print("[RAG_DEBUG]", *parts, flush=True)
 
 SYSTEM_PROMPT = """
 You are ResearchPilot AI, a careful research-paper assistant.
@@ -245,7 +268,7 @@ def _fit_passages_to_token_budget(
     packed, used, original_total, compressed_count, dropped = [], 0, 0, 0, 0
 
     for passage in passages:
-        text = _clean_passage_text(str(passage.get("text", "")))
+        text = _trim_leading_fragment(_clean_passage_text(str(passage.get("text", ""))))
 
         if not text:
             continue
@@ -479,6 +502,132 @@ def _clean_passage_text(text: str, max_chars: int | None = None) -> str:
 
 
 # ---------------------------------------------------------
+# Sentence-complete evidence
+# ---------------------------------------------------------
+
+_SPACED_LETTERS = re.compile(r"^(?:[A-Za-z]\s){3,}[A-Za-z]$")      # "E D U C A T I O N"
+_END_PUNCT = re.compile(r'[.!?]["\')\]]*$')
+_ABBREV_END = re.compile(
+    r"(?:\b(?:Fig|Figs|Eq|Eqs|Tab|Sec|al|vs|etc|cf|approx|No|Dr|Prof)|\be\.g|\bi\.e)\.$",
+    re.IGNORECASE,
+)
+
+
+_BOILERPLATE = re.compile(
+    r"^\s*(?:page\s+\d+|\d+|https?://\S+|.*\bwww\.\S+.*|.*\S+@\S+\.\S+.*|issn\b.*|"
+    r"volume\s+\d+.*|vol\.\s*\d+.*|international journal.*|journal of .*\d{4}.*|"
+    r"copyright.*|\u00a9.*|all rights reserved.*)\s*$",
+    re.IGNORECASE,
+)
+_BULLET = re.compile(r"^\s*[\uf000-\uf8ff\u2022\u25aa\u25cf\u25e6\u2023\u25b6\u25ba\u25a0\u25a1*\-\u2013]\s*")
+_ENUM_HEADING = re.compile(r"^(?:[A-Z]|[IVX]+|\d+(?:\.\d+)*)[.)]\s+[A-Z]")
+
+
+def _join_wrapped_lines(text: str) -> str:
+    """
+    Re-join PDF line wraps inside a paragraph, while removing journal
+    running headers / page footers and treating headings and bullets as
+    paragraph breaks (so they never glue onto the next sentence).
+    """
+    out: list[str] = []
+
+    for raw in text.replace("\r\n", "\n").split("\n"):
+        line = raw.strip()
+
+        if not line:
+            out.append("\n\n")
+            continue
+
+        if _BOILERPLATE.match(line):
+            continue
+
+        is_heading = (
+            (line.isupper() or _ENUM_HEADING.match(line))
+            and len(line.split()) <= 12
+            and not _END_PUNCT.search(line)
+        )
+
+        if is_heading:
+            out.append("\n\n")
+            continue
+
+        if _BULLET.match(raw):
+            out.append("\n\n")
+            line = _BULLET.sub("", raw, count=1).strip()
+
+        out.append(line + " ")
+
+    joined = "".join(out)
+    joined = re.sub(r"[ \t]*\n\n[ \t]*(?:\n\n[ \t]*)*", "\n\n", joined)
+
+    return re.sub(r"[ \t]+", " ", joined).strip()
+
+
+def _trim_leading_fragment(text: str) -> str:
+    """Drop the broken start of a chunk that was cut mid-word / mid-sentence."""
+    text = text.lstrip()
+
+    if not text or not text[0].islower():
+        return text
+
+    boundary = re.search(r"[.!?]\s+(?=[A-Z0-9\[(])", text)
+
+    if boundary and boundary.end() < len(text) * 0.6:
+        return text[boundary.end():].lstrip()
+
+    parts = text.split(None, 1)          # no boundary nearby: drop the partial word
+    return parts[1] if len(parts) == 2 else text
+
+
+def _split_sentences(text: str) -> list[str]:
+    raw = [s.strip() for s in _SENTENCE_SPLIT.split(text) if s and s.strip()]
+    merged: list[str] = []
+
+    for sentence in raw:                  # "Fig." / "et al." are not sentence ends
+        if merged and _ABBREV_END.search(merged[-1]):
+            merged[-1] += " " + sentence
+        else:
+            merged.append(sentence)
+
+    return merged
+
+
+def _complete_sentences(text: str, max_chars: int = EVIDENCE_DISPLAY_CHARS) -> str:
+    """
+    Evidence for display: only COMPLETE, meaningful sentences.
+    Removes cut-off starts/ends, headings, spaced-letter junk and fragments.
+    """
+    text = _trim_leading_fragment(_join_wrapped_lines(_clean_passage_text(text)))
+
+    good = []
+
+    for sentence in _split_sentences(text):
+        sentence = re.sub(r"\s+", " ", sentence)
+
+        if _SPACED_LETTERS.match(sentence):
+            continue
+        if len(sentence.split()) < 4 or len(re.findall(r"[A-Za-z]{3,}", sentence)) < 2:
+            continue
+        if not _END_PUNCT.search(sentence):   # trailing fragment / heading
+            continue
+
+        good.append(sentence)
+
+    if not good:
+        return text.strip()
+
+    out, used = [], 0
+
+    for sentence in good:
+        if out and used + len(sentence) > max_chars:
+            break                              # never cut a sentence in half
+        out.append(sentence)
+        used += len(sentence) + 1
+
+    return " ".join(out)
+
+
+# ---------------------------------------------------------
 # Chunk metadata helpers
 # ---------------------------------------------------------
 
@@ -653,9 +802,7 @@ def _format_sources(chunks: list[dict[str, Any]]) -> list[dict[str, Any]]:
     sources = []
 
     for chunk in chunks:
-        text = _clean_passage_text(
-            str(chunk.get("text", "")), max_chars=MAX_PASSAGE_CHARACTERS
-        )
+        text = _complete_sentences(str(chunk.get("text", "")))
 
         if not text:
             continue
@@ -742,6 +889,10 @@ def _classify_question(question: str) -> str:
     whole_paper = _contains_phrase(q, (
         "summarize", "summarise", "summary", "overview",
         "whole paper", "entire paper", "paper about", "main idea",
+        "document about", "this about", "about this", "tell me about",
+        "describe this", "what does this document", "what does this paper",
+        "what is this document", "what is this paper", "key points",
+        "main points", "gist", "tldr", "what is it about", "who is this",
     ))
 
     # "Summarize the methodology" is a FOCUSED question, not a whole-paper
@@ -756,23 +907,35 @@ def _classify_question(question: str) -> str:
 # Retrieval relevance gate
 # ---------------------------------------------------------
 
+STRICT_GATE = os.getenv("RAG_STRICT_GATE", "0") == "1"
+
+
 def _has_relevant_evidence(question: str, passages: list[dict[str, Any]]) -> bool:
     """
-    Lenient pre-LLM gate: reject only clearly unrelated retrievals. The LLM
-    may still abstain and the validator still checks the answer. Thresholds
-    are heuristics; calibrate them with the evaluation harness.
+    Pre-LLM gate.
+
+    Default (soft): refuse only when there is NO usable passage (nothing
+    retrieved, or only reference-list text). Everything else goes to the
+    LLM, which is told to answer INSUFFICIENT_EVIDENCE when the passages do
+    not help, and whose answer is validated afterwards. A hard similarity
+    gate wrongly rejected short or abstract questions ("conclusion",
+    "what is X") even when the right section was retrieved.
+
+    Set RAG_STRICT_GATE=1 to also require score thresholds (tune them with
+    the evaluation harness first).
     """
 
-    if not passages:
+    usable = [p for p in passages if not _is_reference(p)]
+
+    if not usable:
         return False
 
-    for passage in passages:
-        if _is_reference(passage):
-            continue
+    if not STRICT_GATE:
+        return True
 
+    for passage in usable:
         try:
             if passage.get("reranker_used") and passage.get("reranker_score") is not None:
-                # Calibrated cross-encoder probability.
                 if float(passage["reranker_score"]) >= MIN_RERANK_SCORE:
                     return True
                 continue
@@ -933,6 +1096,142 @@ def _withhold_answer(reason: str) -> str:
 
 
 # ---------------------------------------------------------
+# Grounding check, evidence selection
+# ---------------------------------------------------------
+
+GROUNDING_MIN_COVERAGE = 0.6
+
+
+def _stem_terms(text: str) -> set[str]:
+    return {
+        t[:-1] if t.endswith("s") and len(t) > 4 else t
+        for t in re.findall(r"[a-z0-9]+", text.lower())
+        if len(t) > 2 and t not in _QUESTION_STOP
+    }
+
+
+def _grounding_check(
+    answer: str, passages: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """
+    Sentence-level support check: the content words of every answer sentence
+    must appear in the page(s) that sentence cites (or anywhere in the
+    evidence when it cites none). A lexical proxy, NOT proof of truth.
+    """
+    by_page: dict[Any, set[str]] = {}
+
+    for p in passages:
+        by_page.setdefault(_page_number(p), set()).update(
+            _stem_terms(str(p.get("text", "")))
+        )
+
+    everything = set().union(*by_page.values()) if by_page else set()
+
+    # "claim. [Page 2]" -> "claim [Page 2]."  (citation stays with its sentence)
+    text = re.sub(
+        r"([.!?])\s*((?:\[\s*pages?\b[^\]]*\]\s*)+)", r" \2\1 ", answer, flags=re.I
+    )
+
+    checked, unsupported = 0, []
+
+    for sentence in re.split(r"(?<=[.!?])\s+|\n+", text):
+        terms = _stem_terms(_PAGE_RE.sub(" ", sentence))
+
+        if len(terms) < 3:
+            continue
+
+        checked += 1
+        cited = _extract_cited_pages(sentence)
+        evidence = (
+            set().union(*(by_page.get(page, set()) for page in cited))
+            if cited
+            else everything
+        )
+        coverage = len(terms & evidence) / len(terms)
+
+        if coverage < GROUNDING_MIN_COVERAGE:
+            unsupported.append(
+                {"sentence": _PAGE_RE.sub("", sentence).strip()[:200], "coverage": round(coverage, 2)}
+            )
+
+    return {"sentences_checked": checked, "unsupported": unsupported}
+
+
+def _choose_display_passages(
+    passages: list[dict[str, Any]], answer: str, limit: int = DISPLAY_EVIDENCE_PASSAGES
+) -> list[dict[str, Any]]:
+    """Evidence cards: passages the answer cites first, then best-ranked."""
+    cited = _extract_cited_pages(answer)
+    first = [p for p in passages if _page_number(p) in cited]
+    rest = [p for p in passages if p not in first]
+    chosen = (first + rest)[:limit]
+
+    return [p for p in passages if p in chosen]
+
+
+def _pick_summary_evidence(
+    chunks: list[dict[str, Any]], summary: str, limit: int = DISPLAY_EVIDENCE_PASSAGES
+) -> list[dict[str, Any]]:
+    """Evidence for a summary: the chunks whose wording the summary reuses most."""
+    summary_terms = _stem_terms(_PAGE_RE.sub(" ", summary))
+    preferred = ("abstract", "summary", "introduction", "conclusion", "overview")
+    scored = []
+
+    for chunk in chunks:
+        if _is_reference(chunk):
+            continue
+
+        text = _complete_sentences(str(chunk.get("text", "")))
+
+        if len(text.split()) < 12:
+            continue
+
+        terms = _stem_terms(text)
+
+        if not terms or not summary_terms:
+            continue
+
+        score = len(summary_terms & terms) / math.sqrt(len(summary_terms) * len(terms))
+        score += 0.05 if any(w in _section(chunk).lower() for w in preferred) else 0.0
+        scored.append((score, chunk))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+
+    picked, pages = [], set()
+
+    for _, chunk in scored:                       # prefer different pages
+        if _page_number(chunk) not in pages:
+            picked.append(chunk)
+            pages.add(_page_number(chunk))
+
+        if len(picked) >= limit:
+            break
+
+    for _, chunk in scored:                       # top up if too few pages
+        if len(picked) >= limit:
+            break
+        if chunk not in picked:
+            picked.append(chunk)
+
+    return picked
+
+
+def _strip_invalid_citations(answer: str, allowed_pages: set[int]) -> str:
+    def repl(match: re.Match) -> str:
+        pages = _pages_in(match.group(1))
+        return "" if pages and not pages <= allowed_pages else match.group(0)
+
+    return _PAGE_RE.sub(repl, answer)
+
+
+def _wants_detail(question: str) -> bool:
+    return bool(re.search(
+        r"\b(detail|detailed|in depth|in-depth|comprehensive|thorough|full summary|long)\b",
+        question, re.I,
+    ))
+
+
+# ---------------------------------------------------------
 # Prompts
 # ---------------------------------------------------------
 
@@ -1024,24 +1323,30 @@ PARTIAL SUMMARIES:
 """.strip()
 
 
-def _final_prompt(summaries: str) -> str:
+def _final_prompt(text: str, detailed: bool = False) -> str:
+    length = (
+        "Write a detailed summary in 4-6 short paragraphs."
+        if detailed
+        else "Write a SHORT summary: 4-6 complete sentences (about 90-150 words) "
+             "in one paragraph, then at most 4 key-point bullets, each one "
+             "complete sentence."
+    )
+
     return f"""
-Create a professional summary of this research paper.
+Summarize the document text below.
 
-Use these headings:
-1. Overview
-2. Research Problem and Objectives
-3. Methodology
-4. Main Findings
-5. Limitations and Future Work
-6. Conclusion
+{length}
 
-Include only details supported by the partial summaries.
-If information is unavailable, say it is not stated.
-Keep [Page N] references. Do not invent facts.
+If it is a research paper, cover in this order, only where stated: the
+problem or objective, the method and data, the main findings, and the key
+limitation. If it is another kind of document (CV, report, article...), say
+what it is and summarize its most important content.
 
-PARTIAL SUMMARIES:
-{summaries}
+Use only what is stated. Do not invent facts or numbers. Leave out anything
+not stated. Keep [Page N] references. Every sentence must be complete.
+
+TEXT:
+{text}
 """.strip()
 
 
@@ -1063,7 +1368,7 @@ def _summary_call(prompt: str, max_tokens: int, usage: dict[str, Any]) -> str:
 
 
 def _whole_document_summary(
-    chunks: list[dict[str, Any]], usage: dict[str, Any]
+    chunks: list[dict[str, Any]], usage: dict[str, Any], detailed: bool = False
 ) -> tuple[str, list[dict[str, Any]]]:
     """Token-aware map-reduce over ALL content chunks."""
 
@@ -1099,6 +1404,17 @@ def _whole_document_summary(
     if not blocks:
         return "The document did not contain enough readable text.", content_chunks
 
+    # Short documents (CVs, small papers): ONE call straight from the text.
+    if sum(_estimate_tokens(b) for b in blocks) <= SUMMARY_INPUT_TOKENS:
+        return (
+            _summary_call(
+                _final_prompt("\n\n".join(blocks), detailed),
+                SUMMARY_FINAL_TOKENS if detailed else SUMMARY_SHORT_TOKENS,
+                usage,
+            ),
+            content_chunks,
+        )
+
     current = [
         _summary_call(_batch_prompt("\n\n".join(group)), SUMMARY_BATCH_TOKENS, usage)
         for group in _batch_by_tokens(blocks, SUMMARY_INPUT_TOKENS)
@@ -1121,7 +1437,9 @@ def _whole_document_summary(
         ]
 
     final = _summary_call(
-        _final_prompt("\n\n---\n\n".join(current)), SUMMARY_FINAL_TOKENS, usage
+        _final_prompt("\n\n---\n\n".join(current), detailed),
+        SUMMARY_FINAL_TOKENS if detailed else SUMMARY_SHORT_TOKENS,
+        usage,
     )
 
     return final, content_chunks
@@ -1147,7 +1465,7 @@ def answer_question(
         "answer": "",
         "sources": [],
         "extracted_text": "",
-        "grounding_status": "No evidence",
+        "grounding_status": STATUS_ABSTAINED,
         "usage": usage,
         "retrieval": {},
     }
@@ -1182,15 +1500,23 @@ def answer_question(
     try:
         # ---------- whole-document summary ----------
         if question_type == "summary" and all_chunks:
-            answer, summary_chunks = _whole_document_summary(all_chunks, usage)
+            answer, summary_chunks = _whole_document_summary(
+                all_chunks, usage, detailed=_wants_detail(question)
+            )
+
+            allowed = {
+                int(_page_number(c)) for c in summary_chunks
+                if isinstance(_page_number(c), int)
+            }
+            answer = _normalize_citations(_strip_invalid_citations(answer, allowed))
 
             return {
                 "answer": answer,
-                "sources": _format_sources(summary_chunks),
+                "sources": _format_sources(_pick_summary_evidence(summary_chunks, answer)),
                 "extracted_text": _build_context(summary_chunks, max_chars=MAX_PASSAGE_CHARACTERS),
-                "grounding_status": "Summary generated (not citation-verified)",
+                "grounding_status": STATUS_SUMMARY,
                 "usage": usage,
-                "retrieval": {"mode": "map-reduce", "chunks": len(summary_chunks)},
+                "retrieval": {"mode": "whole-document", "chunks": len(summary_chunks)},
             }
 
         # ---------- focused retrieval ----------
@@ -1238,84 +1564,129 @@ def answer_question(
                 "retrieval": retrieval_info,
             }
 
-        # ---------- token-budgeted context ----------
-        budget = _context_token_budget(question)
-        selected, pack_stats = _fit_passages_to_token_budget(question, selected, budget)
-        context = _build_context(selected)
+        if DEBUG:
+            _debug(f"question={question!r} type={question_type} reranked={reranked}")
+            for c in candidates[:10]:
+                _debug(
+                    f"  cand page={_page_number(c)} section={_section(c)!r} "
+                    f"sim={c.get('similarity')} rerank={c.get('reranker_score')} "
+                    f"section_match={c.get('section_match')} | {str(c.get('text',''))[:70]!r}"
+                )
+            _debug("selected pages:", [(_page_number(p), _section(p)) for p in selected])
 
-        retrieval_info["packing"] = pack_stats
+        def attempt(passages: list[dict[str, Any]], thorough: bool = False) -> dict[str, Any]:
+            """Pack -> ask -> (abstain | validate -> one corrective retry)."""
+            packed, stats = _fit_passages_to_token_budget(
+                question, passages, _context_token_budget(question)
+            )
+            context = _build_context(packed)
 
-        if not context.strip():
-            return {
-                **empty_result,
-                "answer": "The retrieved passages contained no readable text.",
-                "retrieval": retrieval_info,
-            }
+            if not context.strip():
+                return {"status": "empty", "packed": packed, "context": context, "stats": stats}
 
-        messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": _build_answer_prompt(question, question_type, context)},
-        ]
+            prompt = _build_answer_prompt(question, question_type, context)
 
-        answer = _call_groq(messages, max_tokens=MAX_ANSWER_TOKENS, temperature=0.2, usage=usage)
-        answer = re.sub(r"^[\s\-–—•]+", "", answer.strip())
+            if thorough:
+                prompt += (
+                    "\n\nBe thorough: the answer may be spread across several passages. "
+                    "Use every relevant passage, combine them, and give a PARTIAL answer "
+                    "if only some of the question is covered. Reply INSUFFICIENT_EVIDENCE "
+                    "only if no passage is relevant at all."
+                )
 
-        sources = _format_sources(selected)
+            raw = _call_groq(
+                [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": prompt}],
+                max_tokens=MAX_ANSWER_TOKENS, temperature=0.2, usage=usage,
+            )
+            raw = re.sub(r"^[\s\-–—•]+", "", raw.strip())
+            _debug(f"LLM reply (thorough={thorough}):", raw[:400])
+
+            base = {"packed": packed, "context": context, "stats": stats}
+
+            # An honest abstention is NOT a validation failure: no retry.
+            if _is_abstention(raw):
+                return {**base, "status": "abstain"}
+
+            answer = raw.replace(INSUFFICIENT_EVIDENCE, "").strip()
+            valid, reason = _validate_answer(answer, packed)
+
+            if not valid:
+                _debug("validation failed:", reason)
+                retry = _call_groq(
+                    [
+                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "user", "content": _build_retry_prompt(question, context, reason, answer)},
+                    ],
+                    max_tokens=MAX_ANSWER_TOKENS, temperature=0.1, usage=usage,
+                )
+                retry = re.sub(r"^[\s\-–—•]+", "", retry.strip())
+                _debug("LLM retry reply:", retry[:400])
+
+                if _is_abstention(retry):
+                    return {**base, "status": "abstain"}
+
+                answer = retry.replace(INSUFFICIENT_EVIDENCE, "").strip()
+                valid, reason = _validate_answer(answer, packed)
+
+            return {**base, "status": "ok" if valid else "invalid", "answer": answer, "reason": reason}
+
+        outcome = attempt(selected)
+
+        # Second chance: the model abstained on the top passages. Widen the
+        # evidence (more passages, no early refusal) before giving up.
+        if outcome["status"] == "abstain":
+            expanded = _select_passages(question, candidates, limit=MAX_CONTEXT_PASSAGES)
+
+            if len(expanded) > len(selected):
+                retrieval_info["second_chance"] = True
+                _debug(f"abstained on {len(selected)} passages; retrying with {len(expanded)}")
+                outcome = attempt(expanded, thorough=True)
+
+        packed, context = outcome["packed"], outcome["context"]
+        retrieval_info["packing"] = outcome["stats"]
 
         def finish(status: str, text: str) -> dict[str, Any]:
             return {
                 "answer": text,
-                "sources": sources,
+                "sources": _format_sources(_choose_display_passages(packed, text)),
                 "extracted_text": context,
                 "grounding_status": status,
                 "usage": usage,
                 "retrieval": retrieval_info,
             }
 
-        # An honest abstention is NOT a validation failure: no retry, no
-        # "withheld" message (the old code nudged the model to answer anyway).
-        if _is_abstention(answer):
+        if outcome["status"] == "empty":
+            return {
+                **empty_result,
+                "answer": "The retrieved passages contained no readable text.",
+                "retrieval": retrieval_info,
+            }
+
+        if outcome["status"] == "abstain":
             return finish(
-                "Insufficient evidence",
+                STATUS_ABSTAINED,
                 "The document does not contain enough information to answer this question.",
             )
 
-        answer = answer.replace(INSUFFICIENT_EVIDENCE, "").strip()
-        valid, reason = _validate_answer(answer, selected)
-
-        if not valid:
-            retry = _call_groq(
-                [
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": _build_retry_prompt(question, context, reason, answer)},
-                ],
-                max_tokens=MAX_ANSWER_TOKENS,
-                temperature=0.1,
-                usage=usage,
-            )
-            retry = re.sub(r"^[\s\-–—•]+", "", retry.strip())
-
-            if _is_abstention(retry):
-                return finish(
-                    "Insufficient evidence",
-                    "The document does not contain enough information to answer this question.",
-                )
-
-            answer = retry.replace(INSUFFICIENT_EVIDENCE, "").strip()
-            valid, reason = _validate_answer(answer, selected)
+        answer = outcome["answer"]
 
         if usage["truncated"]:
             answer += "\n\n*(The answer reached the length limit and may be incomplete.)*"
 
-        if not valid:
-            return finish("Withheld", _withhold_answer(reason))
+        if outcome["status"] == "invalid":
+            return finish(STATUS_WITHHELD, _withhold_answer(outcome["reason"]))
 
-        return finish("Partially verified", _normalize_citations(answer))
+        final_answer = _normalize_citations(answer)
+        grounding = _grounding_check(final_answer, packed)
+        grounding["label"] = "Partially verified" if grounding["unsupported"] else "Verified"
+        result = finish(STATUS_ANSWERED, final_answer)
+        result["grounding_detail"] = grounding
+        return result
 
     except RuntimeError as exc:
         # Provider / network failures should not crash the UI.
         return {
             **empty_result,
             "answer": f"The language model request failed: {exc}",
-            "grounding_status": "Error",
+            "grounding_status": STATUS_ERROR,
         }

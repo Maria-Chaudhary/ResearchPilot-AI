@@ -32,6 +32,44 @@ REFERENCE_HEADINGS = {
 
 REFERENCE_PENALTY = 0.35
 RRF_K = 60
+SECTION_MATCH_RRF_BONUS = 0.02
+SECTION_MATCH_SIM_BONUS = 0.10
+SECTION_MATCH_FINAL_BONUS = 0.15
+MAX_INTENT_CHUNKS = 8
+
+# Question wording -> section-title fragments that usually hold the answer.
+# Works for any paper because it matches fragments ("conclusion" also matches
+# "Findings, Conclusion And Recommendations" or "Summary And Conclusion").
+SECTION_INTENTS = (
+    (r"\b(conclusions?|conclude|concluding|takeaways?|final remarks?)\b",
+     ("conclusion", "recommendation", "summary")),
+    (r"\b(recommend\w*)\b", ("recommendation", "conclusion")),
+    (r"\b(limitations?|weakness\w*|drawbacks?|shortcomings?|threats? to validity)\b",
+     ("limitation", "threat", "discussion", "future work")),
+    (r"\bfuture (work|research|directions?|scope)\b",
+     ("future work", "limitation", "conclusion")),
+    (r"\b(objectives?|aims?|purpose|goals?)\b",
+     ("objective", "introduction", "abstract", "background", "research question")),
+    (r"\bresearch questions?\b", ("research question", "objective")),
+    (r"\b(contributions?)\b", ("contribution", "introduction", "abstract", "conclusion")),
+    (r"\b(methods?|methodology|approach|procedures?|techniques?|design|sampl\w*|"
+     r"dataset|data collection|participants|instruments?|architecture|model used)\b",
+     ("method", "research design", "approach", "data", "experiment", "proposed", "sampl", "model")),
+    (r"\b(results?|findings?|outcomes?|accuracy|performance|evaluation|analysis)\b",
+     ("result", "finding", "analysis", "discussion", "evaluation", "experiment")),
+    (r"\b(abstract|summary|overview|gist)\b", ("abstract", "summary")),
+    (r"\b(introduction|background|motivation|problem statement|statement of the problem|problem)\b",
+     ("introduction", "background", "problem")),
+    (r"\b(related work|prior work|literature|previous studies)\b",
+     ("related work", "literature", "background")),
+    (r"\b(what is|what are|define|definition|meaning of|stands for|refers? to|concept of)\b",
+     ("introduction", "background", "literature", "concept", "definition", "abstract")),
+)
+
+FRONT_MATTER_INTENT = (
+    r"\b(title|authors?|written by|who wrote|published|publication|journal|"
+    r"affiliations?|institutions?|keywords?)\b"
+)
 
 
 def _stem(word: str) -> str:
@@ -126,6 +164,16 @@ def _embedding_text(chunk: dict[str, Any]) -> str:
     return text
 
 
+def _rerank_text(chunk: dict[str, Any]) -> str:
+    """Give the cross-encoder the section title too (it cannot see metadata)."""
+    section = str(chunk.get("section", "") or "").strip()
+
+    if section and section.lower() not in {"unknown", "none", "general"}:
+        return f"{section}. {chunk['text']}"
+
+    return chunk["text"]
+
+
 class FaissVectorStore:
     """
     Hybrid retrieval + optional cross-encoder reranking.
@@ -211,7 +259,7 @@ class FaissVectorStore:
         new_index = faiss.IndexFlatIP(dimension)
         new_index.add(vectors)
 
-        tokenized_chunks = [tokenize(c["text"]) for c in validated]
+        tokenized_chunks = [tokenize(_embedding_text(c)) for c in validated]
 
         document_frequencies: Counter = Counter()
 
@@ -278,6 +326,45 @@ class FaissVectorStore:
             scores[i] = score
 
         return scores
+
+    # -----------------------------------------------------
+    # Question intent -> section / front matter
+    # -----------------------------------------------------
+
+    def _intent_positions(self, query: str) -> set[int]:
+        """Chunks whose SECTION matches what the question is asking about."""
+        q = query.lower()
+        wanted: set[str] = set()
+
+        for pattern, fragments in SECTION_INTENTS:
+            if re.search(pattern, q):
+                wanted.update(fragments)
+
+        positions: list[int] = []
+
+        if wanted:
+            for i, chunk in enumerate(self.chunks):
+                section = str(chunk.get("section", "")).lower()
+
+                if (
+                    section
+                    and not self.reference_flags[i]
+                    and any(fragment in section for fragment in wanted)
+                ):
+                    positions.append(i)
+
+        positions = positions[:MAX_INTENT_CHUNKS]
+
+        if re.search(FRONT_MATTER_INTENT, q):  # title / authors live on page 1
+            def page_key(i: int):
+                try:
+                    return (int(self.chunks[i].get("page", 10**6)), i)
+                except (TypeError, ValueError):
+                    return (10**6, i)
+
+            positions += sorted(range(len(self.chunks)), key=page_key)[:2]
+
+        return set(positions)
 
     # -----------------------------------------------------
     # Search validation
@@ -362,6 +449,9 @@ class FaissVectorStore:
             if bm25_raw[int(position)] > 0:
                 candidates.add(int(position))
 
+        intent_positions = self._intent_positions(query)
+        candidates |= intent_positions
+
         if not candidates:
             return []
 
@@ -404,6 +494,12 @@ class FaissVectorStore:
 
             similarity = 0.7 * max(semantic[position], 0.0) + 0.3 * coverage
 
+            section_match = position in intent_positions
+
+            if section_match:
+                rrf += SECTION_MATCH_RRF_BONUS
+                similarity += SECTION_MATCH_SIM_BONUS
+
             if is_reference:
                 rrf *= 0.3
                 similarity -= REFERENCE_PENALTY
@@ -417,6 +513,7 @@ class FaissVectorStore:
             )
             item["query_term_coverage"] = round(coverage, 4)
             item["is_reference"] = is_reference
+            item["section_match"] = section_match
 
             results.append(item)
 
@@ -471,7 +568,7 @@ class FaissVectorStore:
         reranker = self._reranker or get_reranker()
 
         try:
-            scores = reranker.score(query, [c["text"] for c in candidates])
+            scores = reranker.score(query, [_rerank_text(c) for c in candidates])
         except Exception as exc:
             logger.warning("Reranking skipped: %s", exc)
             return [dict(c, reranker_used=False) for c in candidates[:top_k]]
@@ -483,6 +580,9 @@ class FaissVectorStore:
 
             # The cross-encoder dominates; the first-stage signal breaks ties.
             final = 0.8 * score + 0.2 * float(candidate.get("similarity", 0.0))
+
+            if candidate.get("section_match"):
+                final += SECTION_MATCH_FINAL_BONUS
 
             if candidate.get("is_reference"):
                 final -= REFERENCE_PENALTY
