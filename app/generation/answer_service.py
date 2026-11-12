@@ -1,5 +1,7 @@
+import logging
 import math
 import os
+import sys
 import random
 import re
 import time
@@ -68,13 +70,24 @@ STATUS_WITHHELD = os.getenv("RAG_STATUS_WITHHELD", "Withheld")
 STATUS_SUMMARY = os.getenv("RAG_STATUS_SUMMARY", "Summary generated")
 STATUS_ERROR = os.getenv("RAG_STATUS_ERROR", "No evidence")
 
+logger = logging.getLogger("researchpilot.rag")
+
 # PowerShell:  $env:RAG_DEBUG="1"; python web_app.py
 DEBUG = os.getenv("RAG_DEBUG", "0") == "1"
+MAX_QUESTION_CHARS = int(os.getenv("RAG_MAX_QUESTION_CHARS", "2000"))
+LOG_QUESTIONS = os.getenv("RAG_LOG_QUESTIONS", "0") == "1"   # privacy: off by default
+
+if DEBUG and not logging.getLogger().handlers:
+    logging.basicConfig(
+        level=logging.DEBUG, stream=sys.stdout,
+        format="%(asctime)s %(levelname)s %(name)s | %(message)s",
+    )
+    logger.setLevel(logging.DEBUG)
 
 
 def _debug(*parts: Any) -> None:
-    if DEBUG:
-        print("[RAG_DEBUG]", *parts, flush=True)
+    logger.debug(" ".join(str(p) for p in parts))
+
 
 SYSTEM_PROMPT = """
 You are ResearchPilot AI, a careful research-paper assistant.
@@ -472,6 +485,11 @@ def _clean_passage_text(text: str, max_chars: int | None = None) -> str:
     """Clean extracted PDF text. Only clips when max_chars is given."""
 
     text = str(text or "")
+
+    # Markdown / extractor artefacts: image placeholders, heading hashes, **bold**
+    text = re.sub(r"(?m)^\W*==>.*?<==\W*$", "", text)
+    text = re.sub(r"(?m)^[ \t]*#{1,6}[ \t]+", "", text)
+    text = re.sub(r"\*\*|__", "", text)
 
     text = re.sub(r"(?<=[A-Za-z])-\s*\n\s*(?=[a-z])", "", text)
     text = text.replace("\r\n", "\n").replace("\r", "\n")
@@ -881,6 +899,10 @@ def _classify_question(question: str) -> str:
     )):
         aspect = "limitations"
     elif _contains_phrase(q, (
+        "conclusion", "conclusions", "concluding", "conclude", "takeaway", "takeaways",
+    )):
+        aspect = "conclusion"
+    elif _contains_phrase(q, (
         "result", "results", "finding", "findings",
         "accuracy", "performance", "outcome", "conclusion",
     )):
@@ -1164,9 +1186,7 @@ def _choose_display_passages(
     cited = _extract_cited_pages(answer)
     first = [p for p in passages if _page_number(p) in cited]
     rest = [p for p in passages if p not in first]
-    chosen = (first + rest)[:limit]
-
-    return [p for p in passages if p in chosen]
+    return (first + rest)[:limit]      # cited passages first, then best-ranked
 
 
 def _pick_summary_evidence(
@@ -1264,6 +1284,10 @@ Requirements:
 - For methodology, explain the approach and steps when supported.
 - For results, report actual findings and metrics when present.
 - For objectives, state the research aim and problem when supported.
+- For conclusion questions, report the authors' concluding statements and main
+  takeaways. The conclusion is usually in the final passages or a section named
+  Conclusion / Summary / Recommendations; put it first. Do not treat passing
+  uses of the word "conclusions" in the middle of the paper as the conclusion.
 - Begin with a complete sentence and finish every sentence.
 """.strip()
 
@@ -1449,7 +1473,7 @@ def _whole_document_summary(
 # Main answer function
 # ---------------------------------------------------------
 
-def answer_question(
+def _answer_question_impl(
     question: str,
     store: Any,
     top_k: int = 5,
@@ -1690,3 +1714,96 @@ def answer_question(
             "answer": f"The language model request failed: {exc}",
             "grounding_status": STATUS_ERROR,
         }
+
+
+def answer_question(
+    question: str,
+    store: Any,
+    top_k: int = 5,
+) -> dict[str, Any]:
+    """
+    Public entry point: input limits, timing, structured logging, and a
+    guarantee that the UI always receives a well-formed result instead of
+    an exception.
+
+    Returns: answer, sources, extracted_text, grounding_status, usage, retrieval
+    """
+    started = time.perf_counter()
+    question = str(question or "").strip()
+
+    def error_result(message: str) -> dict[str, Any]:
+        return {
+            "answer": message,
+            "sources": [],
+            "extracted_text": "",
+            "grounding_status": STATUS_ERROR,
+            "usage": _new_usage(),
+            "retrieval": {},
+        }
+
+    if len(question) > MAX_QUESTION_CHARS:
+        return error_result(
+            f"Your question is too long ({len(question)} characters). "
+            f"Please keep it under {MAX_QUESTION_CHARS}."
+        )
+
+    try:
+        result = _answer_question_impl(question, store, top_k=top_k)
+    except ValueError:
+        raise                                   # programmer error (bad top_k): surface it
+    except RuntimeError as exc:                 # e.g. missing API key, provider outage
+        logger.error("answer_question failed: %s", exc)
+        return error_result(str(exc))
+    except Exception:                           # never crash the UI
+        logger.exception("Unexpected error in answer_question")
+        return error_result(
+            "Something went wrong while answering. Please try again; "
+            "if it keeps happening, check the server log."
+        )
+
+    usage = result.get("usage") or {}
+    retrieval = result.get("retrieval") or {}
+
+    logger.info(
+        "rag status=%r mode=%s reranked=%s second_chance=%s sources=%d "
+        "llm_calls=%s tokens=%s latency=%.2fs%s",
+        result.get("grounding_status"),
+        retrieval.get("mode", "retrieval"),
+        retrieval.get("reranked"),
+        retrieval.get("second_chance", False),
+        len(result.get("sources", [])),
+        usage.get("llm_calls"),
+        usage.get("total_tokens"),
+        time.perf_counter() - started,
+        f" question={question[:80]!r}" if LOG_QUESTIONS else "",
+    )
+
+    return result
+
+
+def health_check(store: Any = None) -> dict[str, Any]:
+    """
+    Cheap startup / readiness probe. Call it once when the app starts and log
+    or expose the result (it never raises and makes no network request).
+    """
+    report: dict[str, Any] = {
+        "groq_api_key_set": bool(GROQ_API_KEY),
+        "groq_model": GROQ_MODEL,
+        "tokenizer": "tiktoken" if _get_encoder() is not None else "heuristic (chars/3.5)",
+        "context_window_tokens": CONTEXT_WINDOW_TOKENS,
+        "strict_gate": STRICT_GATE,
+    }
+
+    try:
+        from app.retrieval.reranker import get_reranker
+
+        report["reranker_available"] = bool(get_reranker().available)
+    except Exception as exc:
+        report["reranker_available"] = False
+        report["reranker_error"] = str(exc)
+
+    if store is not None and callable(getattr(store, "index_report", None)):
+        report["index"] = store.index_report()
+
+    report["ok"] = report["groq_api_key_set"]
+    return report

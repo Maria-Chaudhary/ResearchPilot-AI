@@ -40,6 +40,10 @@ MAX_INTENT_CHUNKS = 8
 # Question wording -> section-title fragments that usually hold the answer.
 # Works for any paper because it matches fragments ("conclusion" also matches
 # "Findings, Conclusion And Recommendations" or "Summary And Conclusion").
+DEFINITION_PATTERN = (
+    r"\b(what is|what are|define|definition|meaning of|stands for|refers? to|concept of)\b"
+)
+
 SECTION_INTENTS = (
     (r"\b(conclusions?|conclude|concluding|takeaways?|final remarks?)\b",
      ("conclusion", "recommendation", "summary")),
@@ -62,9 +66,28 @@ SECTION_INTENTS = (
      ("introduction", "background", "problem")),
     (r"\b(related work|prior work|literature|previous studies)\b",
      ("related work", "literature", "background")),
-    (r"\b(what is|what are|define|definition|meaning of|stands for|refers? to|concept of)\b",
+    (DEFINITION_PATTERN,
      ("introduction", "background", "literature", "concept", "definition", "abstract")),
 )
+
+END_SECTIONS = ("conclusion", "recommendation", "summary", "future work")
+START_SECTIONS = ("abstract", "introduction", "background", "overview")
+
+# Position-based intents: many papers (essays, short papers, theses) have NO
+# heading called "Conclusion", the conclusion is simply the closing text.
+POSITION_END_INTENT = (
+    r"\b(conclusions?|conclude|concluding|takeaways?|final remarks?|recommend\w*|"
+    r"future (work|research|directions?|scope))\b"
+)
+POSITION_START_INTENT = (
+    r"\b(abstract|overview|gist|introduction|objectives?|aims?|purpose|"
+    r"what is this (paper|document|study|article) about)\b"
+)
+# Weight of a positional match, closest-to-the-edge first. The very last chunk
+# is the most likely conclusion; mid-paper chunks that merely contain the word
+# "conclusions" must not outrank it.
+POSITION_WEIGHTS = (2.5, 1.0, 0.4)
+END_CHUNKS = START_CHUNKS = len(POSITION_WEIGHTS)
 
 FRONT_MATTER_INTENT = (
     r"\b(title|authors?|written by|who wrote|published|publication|journal|"
@@ -280,6 +303,33 @@ class FaissVectorStore:
         self.dimension = dimension
         self.reference_flags = reference_flags
 
+        report = self.index_report()
+        logger.info(
+            "Indexed %d chunks; sections=%s",
+            report["chunks"],
+            [f'{x["section"]}({x["chunks"]})' for x in report["sections"]][:25],
+        )
+
+    def index_report(self) -> dict[str, Any]:
+        """What was indexed: use it to check that headings were detected."""
+        sections: dict[str, dict[str, Any]] = {}
+
+        for chunk in self.chunks:
+            name = str(chunk.get("section", "") or "Unknown")
+            entry = sections.setdefault(name, {"section": name, "chunks": 0, "pages": []})
+            entry["chunks"] += 1
+            entry["pages"].append(chunk.get("page"))
+
+        for entry in sections.values():
+            pages = [p for p in entry["pages"] if isinstance(p, int)]
+            entry["pages"] = [min(pages), max(pages)] if pages else []
+
+        return {
+            "chunks": len(self.chunks),
+            "sections": list(sections.values()),
+            "has_conclusion_section": any("conclusion" in n.lower() for n in sections),
+        }
+
     # -----------------------------------------------------
     # BM25 (raw scores; callers decide how to use them)
     # -----------------------------------------------------
@@ -331,40 +381,59 @@ class FaissVectorStore:
     # Question intent -> section / front matter
     # -----------------------------------------------------
 
-    def _intent_positions(self, query: str) -> set[int]:
-        """Chunks whose SECTION matches what the question is asking about."""
+    def _intent_positions(self, query: str) -> dict[int, float]:
+        """Chunks that probably hold the answer, judged from the question wording."""
         q = query.lower()
+        sections = [str(c.get("section", "")).lower() for c in self.chunks]
+        content = [i for i in range(len(self.chunks)) if not self.reference_flags[i]]
+
         wanted: set[str] = set()
+        generic: set[str] = set()
 
         for pattern, fragments in SECTION_INTENTS:
             if re.search(pattern, q):
-                wanted.update(fragments)
+                # The generic "what is / define" rule must not override a
+                # specific one ("what is the conclusion" is about the conclusion).
+                (generic if pattern is DEFINITION_PATTERN else wanted).update(fragments)
 
-        positions: list[int] = []
+        wanted = wanted or generic
+
+        weights: dict[int, float] = {}
+
+        def add(position: int, weight: float) -> None:
+            weights[position] = max(weights.get(position, 0.0), weight)
 
         if wanted:
-            for i, chunk in enumerate(self.chunks):
-                section = str(chunk.get("section", "")).lower()
+            for i in [
+                i for i in content
+                if sections[i] and any(f in sections[i] for f in wanted)
+            ][:MAX_INTENT_CHUNKS]:
+                add(i, 1.0)
 
-                if (
-                    section
-                    and not self.reference_flags[i]
-                    and any(fragment in section for fragment in wanted)
-                ):
-                    positions.append(i)
+        # Heading-less papers: fall back to WHERE the text sits.
+        def has_section(fragments: tuple[str, ...]) -> bool:
+            return any(any(f in sec for f in fragments) for sec in sections)
 
-        positions = positions[:MAX_INTENT_CHUNKS]
+        if content:
+            if re.search(POSITION_END_INTENT, q) and not has_section(END_SECTIONS):
+                for i, w in zip(reversed(content[-END_CHUNKS:]), POSITION_WEIGHTS):
+                    add(i, w)                               # last chunk first
 
-        if re.search(FRONT_MATTER_INTENT, q):  # title / authors live on page 1
+            if re.search(POSITION_START_INTENT, q) and not has_section(START_SECTIONS):
+                for i, w in zip(content[:START_CHUNKS], POSITION_WEIGHTS):
+                    add(i, w)                               # first chunk first
+
+        if re.search(FRONT_MATTER_INTENT, q):               # title / authors live on page 1
             def page_key(i: int):
                 try:
                     return (int(self.chunks[i].get("page", 10**6)), i)
                 except (TypeError, ValueError):
                     return (10**6, i)
 
-            positions += sorted(range(len(self.chunks)), key=page_key)[:2]
+            for i, w in zip(sorted(range(len(self.chunks)), key=page_key)[:2], (1.5, 1.0)):
+                add(i, w)
 
-        return set(positions)
+        return weights
 
     # -----------------------------------------------------
     # Search validation
@@ -450,7 +519,7 @@ class FaissVectorStore:
                 candidates.add(int(position))
 
         intent_positions = self._intent_positions(query)
-        candidates |= intent_positions
+        candidates |= set(intent_positions)
 
         if not candidates:
             return []
@@ -494,11 +563,12 @@ class FaissVectorStore:
 
             similarity = 0.7 * max(semantic[position], 0.0) + 0.3 * coverage
 
-            section_match = position in intent_positions
+            weight = intent_positions.get(position, 0.0)
+            section_match = weight > 0
 
             if section_match:
-                rrf += SECTION_MATCH_RRF_BONUS
-                similarity += SECTION_MATCH_SIM_BONUS
+                rrf += SECTION_MATCH_RRF_BONUS * weight
+                similarity += SECTION_MATCH_SIM_BONUS * min(weight, 1.5)
 
             if is_reference:
                 rrf *= 0.3
@@ -514,6 +584,7 @@ class FaissVectorStore:
             item["query_term_coverage"] = round(coverage, 4)
             item["is_reference"] = is_reference
             item["section_match"] = section_match
+            item["intent_weight"] = weight
 
             results.append(item)
 
@@ -582,7 +653,9 @@ class FaissVectorStore:
             final = 0.8 * score + 0.2 * float(candidate.get("similarity", 0.0))
 
             if candidate.get("section_match"):
-                final += SECTION_MATCH_FINAL_BONUS
+                final += SECTION_MATCH_FINAL_BONUS * min(
+                    float(candidate.get("intent_weight", 1.0)), 2.0
+                )
 
             if candidate.get("is_reference"):
                 final -= REFERENCE_PENALTY

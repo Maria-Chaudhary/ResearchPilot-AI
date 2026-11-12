@@ -87,6 +87,8 @@ def clean_text(text: str) -> str:
     """Clean text extracted from research papers."""
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = text.replace("\u00ad", "")
+    # pymupdf4llm image placeholders: **==> picture [..] intentionally omitted <==**
+    text = re.sub(r"(?m)^\W*==>.*?<==\W*$", "", text)
     # Private-use / symbol bullets at the start of a line become "- ".
     text = re.sub(
         r"(?m)^[ \t]*[\uf000-\uf8ff\u2022\u25aa\u25cf\u25e6\u2023][ \t]*", "- ", text
@@ -102,7 +104,8 @@ def clean_text(text: str) -> str:
 
 def normalize_heading(line: str) -> str:
     """Normalize numbered research headings."""
-    line = line.strip()
+    line = re.sub(r"^[#>\s]+", "", line.strip())      # Markdown heading / quote markers
+    line = re.sub(r"\*\*|__", "", line).strip()      # **bold** / __bold__ anywhere
     line = re.sub(r"^\d+(?:\.\d+)*\.?\s*", "", line)
     # "V. FINDINGS", "A. Findings", "c) Methods"
     line = re.sub(r"^(?:[IVXLCivxlc]+|[A-Za-z])[.)]\s+", "", line)
@@ -153,12 +156,41 @@ def _pretty_title(text: str) -> str:
     return " ".join(out)
 
 
+_MD_HEADING = re.compile(r"^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$")
+_MD_BOLD_LINE = re.compile(r"^\s*(?:\*\*|__)(.+?)(?:\*\*|__)\s*$")
+_CAPTION = re.compile(r"^\W*(table|figure|fig\.?)\s*\d", re.IGNORECASE)
+
+
 def _heading_title(line: str):
     """Return a clean section title when the line is a heading, else None."""
     stripped = line.strip()
 
     if not stripped:
         return None
+
+    # Markdown output (pymupdf4llm): "## Creativity", "# 5. Conclusion"
+    match = _MD_HEADING.match(stripped)
+
+    if match:
+        inner = match.group(1)
+
+        if len(inner.split()) <= 15 and not _CAPTION.match(normalize_heading(inner)):
+            title = _pretty_title(normalize_heading(inner))
+            return title or None
+
+    # A whole line in bold: "**Conclusion**"
+    match = _MD_BOLD_LINE.match(stripped)
+
+    if match:
+        inner = match.group(1).strip()
+
+        if (
+            len(inner.split()) <= 10
+            and not _END_PUNCT.search(inner)
+            and not _CAPTION.match(inner)
+        ):
+            title = _pretty_title(normalize_heading(inner))
+            return title or None
 
     if (
         is_research_heading(stripped)
