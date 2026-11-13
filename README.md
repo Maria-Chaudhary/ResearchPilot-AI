@@ -1,170 +1,158 @@
-# ResearchPilot AI
+# ResearchPilot AI 📄🤖
 
-Upload a research paper (PDF), ask a question, and get a short answer with **page citations**. The app also shows the exact passages from the paper that support the answer.
+Ask questions about a research paper and get short answers you can trust.
 
-If the paper does not contain the answer, it says so instead of guessing.
+You upload a PDF, type a question, and the app answers in plain language. Every answer shows the **page number** it came from, and the app also shows the **exact lines from the paper** as proof.
 
-<!-- Add a screenshot or GIF here:
-![ResearchPilot AI demo](docs/demo.png)
+If the paper doesn't have the answer, the app says so. It does not make something up.
+
+<!-- Add a screenshot here:
+![Demo](docs/demo.png)
 -->
 
-## Features
+## Why I built this
 
-- **Ask anything about one paper:** objectives, methods, findings, limitations, conclusion, authors, or a short summary.
-- **Page citations:** every claim is marked like `[Page 4]`.
-- **Evidence cards:** complete sentences from the paper, with page number and section.
-- **Honest answers:** if the evidence is missing, the app answers "No evidence".
-- **Answer checks:** page numbers, numbers and wording are compared with the evidence.
-- **Works on papers with or without headings:** a paper that has no "Conclusion" section still gets its closing text found.
+Research papers are long, and finding one answer (like "What is the conclusion?") can take a while. Chatbots can answer quickly, but they sometimes invent things. I wanted a tool that answers from the paper only, and shows where each answer comes from.
 
-## How it works
+## What it can do
 
-```
-PDF
- └─ text extraction (PyMuPDF)
-     └─ chunking          sentence-based chunks, section tracking, header/footer removal
-         └─ indexing      embeddings in FAISS + BM25 keyword index
-             └─ question
-                 ├─ broad question ("summarize this paper") → whole-document summary
-                 └─ focused question
-                     ├─ hybrid search (FAISS + BM25, Reciprocal Rank Fusion)
-                     ├─ section / position boost (e.g. conclusion → closing text)
-                     ├─ cross-encoder reranking
-                     ├─ token-budgeted context
-                     ├─ LLM answer (Llama via Groq), using only the evidence
-                     ├─ checks: citations, numbers, sentence-level wording
-                     └─ one wider second attempt before saying "No evidence"
-```
+- Answer questions about the objectives, methods, findings, limitations, or conclusion
+- Write a short summary of the whole paper
+- Show page numbers like `[Page 4]` next to each point
+- Show proof from the paper, in full sentences
+- Say "No evidence" when the paper doesn't answer the question
+- Work on papers that have no "Conclusion" heading (it looks at the end of the paper)
 
-## Project structure
+## How it works (in simple words)
+
+1. **Read the PDF.** The text is pulled out and cleaned (page numbers and journal headers are removed).
+2. **Cut it into pieces.** The text is split into small chunks, always at the end of a sentence, and the app remembers which section each chunk is from.
+3. **Find the right pieces.** When you ask a question, the app searches in two ways, by meaning and by keywords. A second model then re-checks which pieces fit best.
+4. **Write the answer.** An AI model (Llama, through Groq) writes the answer using only those pieces.
+5. **Check the answer.** The app checks that the page numbers, the numbers, and the wording match the paper.
+6. **Be honest.** If nothing fits, the app tries once more with more text. If it still finds nothing, it says "No evidence".
+
+## What's inside
 
 ```
-web_app.py                         Gradio app
+web_app.py                        the app you open in the browser
 app/
 ├── ingestion/
-│   └── chunking.py                chunking, headings (including Markdown), header removal
+│   └── chunking.py               cleans the text and cuts it into chunks
 ├── retrieval/
-│   ├── embeddings.py              embedding model
-│   ├── vector_store.py            FAISS + BM25 search, section/position boost, rerank()
-│   ├── reranker.py                cross-encoder reranker
-│   └── rag_eval.py                evaluation script
+│   ├── embeddings.py             turns text into numbers for searching
+│   ├── vector_store.py           the search part
+│   ├── reranker.py               re-checks the best matches
+│   └── rag_eval.py               measures how good the results are
 └── generation/
-    └── answer_service.py          answer_question(), checks, summaries, health_check()
-tests/                             automated tests (no model downloads needed)
+    └── answer_service.py         writes and checks the answers
+tests/                            automatic tests
 ```
 
-## Setup
+## How to run it
 
 You need Python 3.10 or newer and a free [Groq API key](https://console.groq.com/).
 
+**1. Make a virtual environment**
 ```powershell
-# 1. Create and activate a virtual environment
 python -m venv .venv
-.venv\Scripts\activate          # Windows
-# source .venv/bin/activate     # Mac / Linux
-
-# 2. Install packages
-python -m pip install -r requirements.txt
-
-# 3. Add your API key
-copy .env.example .env          # then open .env and set GROQ_API_KEY
+.venv\Scripts\activate
 ```
 
-> If `pip.exe` is blocked on your computer, always use `python -m pip ...` as above.
+**2. Install the packages**
+```powershell
+python -m pip install -r requirements.txt
+```
+(I use `python -m pip` because on some Windows computers `pip.exe` is blocked.)
 
-## Run
+**3. Add your API key**
 
+Copy `.env.example` to a new file called `.env`, then open it and paste your key:
+```
+GROQ_API_KEY=your_key_here
+```
+
+**4. Start the app**
 ```powershell
 python web_app.py
 ```
 
-Open the link shown in the terminal (usually `http://127.0.0.1:7860`), upload a PDF, and ask a question.
+Open the link in your terminal (usually `http://127.0.0.1:7860`), upload a PDF, and ask away.
+The first start is slower because the models download once.
 
-The first start downloads the embedding and reranker models, so it takes longer.
+## Questions you can try
 
-## Example questions
+- `Summarize this paper`
+- `What is the conclusion of this paper?`
+- `What methodology was used?`
+- `What are the main findings?`
+- `What are the limitations?`
+- `Who are the authors?`
 
-| Question | What you get |
+Also try a question the paper can't answer (like "Which GPU was used?"). The app should say "No evidence".
+
+## What the status means
+
+| You see | It means |
 |---|---|
-| `Summarize this paper` | A short summary with page citations |
-| `What is the conclusion of this paper?` | The authors' concluding statements |
-| `What methodology was used?` | The methods or research design section |
-| `What are the main findings?` | Results with page citations |
-| `What are the limitations?` | The limitations, or "No evidence" if the paper has none |
-| `Who are the authors?` | Title and author information from page 1 |
+| **Partially verified** | The answer passed the page, number, and wording checks |
+| **No evidence** | The paper doesn't have enough information |
+| **Withheld** | The answer failed the checks, so it was not shown |
+| **Summary generated** | A summary of the whole paper |
 
-## Reading the result
+## Settings (optional)
 
-| Status | Meaning |
+Put these in your `.env` file if you want to change something:
+
+| Setting | What it does |
 |---|---|
-| Partially verified | The answer passed the citation, number and wording checks |
-| No evidence | The paper does not contain enough information |
-| Withheld | The answer failed the checks and was not shown |
-| Summary generated | A whole-document summary |
+| `GROQ_MODEL` | Which Groq model writes the answers |
+| `RAG_DISPLAY_EVIDENCE` | How many proof cards to show (default 2) |
+| `RAG_DEBUG=1` | Prints what the app found and sent to the AI, for debugging |
+| `HF_TOKEN` | Hugging Face token, for faster model downloads |
 
-A more detailed label (`Verified` or `Partially verified`) and any unsupported sentences are in `result["grounding_detail"]`.
-
-## Configuration
-
-Set these in `.env` (all optional except `GROQ_API_KEY`):
-
-| Variable | Default | Purpose |
-|---|---|---|
-| `GROQ_API_KEY` | none | Your Groq API key |
-| `GROQ_MODEL` | `llama-3.3-70b-versatile` | Model used for answers |
-| `RERANKER_MODEL` | `cross-encoder/ms-marco-MiniLM-L-6-v2` | Reranking model |
-| `HF_TOKEN` | none | Hugging Face token (faster model downloads) |
-| `RAG_CONTEXT_WINDOW_TOKENS` | `8192` | Context size used for budgeting |
-| `RAG_MAX_CONTEXT_TOKENS` | `5000` | Maximum evidence tokens per question |
-| `RAG_DISPLAY_EVIDENCE` | `2` | Evidence cards shown |
-| `RAG_STRICT_GATE` | `0` | `1` also requires similarity thresholds before asking the model |
-| `RAG_DEBUG` | `0` | `1` prints a retrieval trace |
-| `RAG_LOG_QUESTIONS` | `0` | `1` adds the question text to logs (off for privacy) |
-
-## Tests
+## Running the tests
 
 ```powershell
 python -m pip install pytest
 python -m pytest
 ```
 
-The tests use small stand-ins for the embedding model and the Groq API, so they run offline and fast. They cover chunking, retrieval, answer checks, error handling and empty model replies.
+The tests don't need internet or an API key. They check the chunking, the search, the answer checks, and error handling.
 
-## Evaluation
+## Measuring quality
 
-`app/retrieval/rag_eval.py` measures retrieval quality (Hit@k, Precision@k, Recall@k, MRR, nDCG@k) and answer behavior (abstention, hallucination rate, citation validity, grounding).
+`app/retrieval/rag_eval.py` tests the app with your own questions. It reports how often the right passage is found and how often the app correctly says "No evidence".
 
 ```powershell
 python -m app.retrieval.rag_eval --chunks chunks.json --dataset eval_set.json --k 5
 ```
 
-Create `eval_set.json` from `app/retrieval/eval_set.example.json` with 20–30 questions about your own paper, including a few the paper cannot answer.
+Copy `app/retrieval/eval_set.example.json`, and write 20–30 questions about your paper. Include a few that the paper can't answer.
 
-Results on my test set: **[add your own numbers here]**
 
-## Debugging a bad answer
+## Something went wrong?
 
-Start the app with debug output (PowerShell):
-
+Turn on debug mode (PowerShell), then ask the same question again:
 ```powershell
 $env:RAG_DEBUG="1"
 python web_app.py
 ```
+The terminal will show which passages were found and what the AI replied.
 
-The terminal then shows the retrieved passages, their scores, the passages sent to the model, and the model's raw replies.
+Also, if you change the chunking code, upload the paper again. The old chunks stay in memory until you do.
 
-## Limitations
+## Things to know
 
-- The checks compare citations, numbers and wording with the evidence. They do **not** prove that a statement is true.
-- PDFs with two columns, scans or complex tables can produce messy text. This comes from text extraction, not from the chunking.
-- Short answers depend on the quality of the chunks. After changing the chunking code, upload the paper again.
-- The free Groq tier has rate limits.
-- Do not upload confidential documents to a shared deployment.
+- The checks compare page numbers, numbers, and wording with the paper. They can't prove that something is true, so always read the evidence cards for important work.
+- PDFs with two columns, scans, or big tables can give messy text.
+- The free Groq plan has limits, so many questions in a short time may be slowed down.
+- Please don't upload private or confidential papers to a shared website.
 
-## Tech stack
+## Built with
 
-Python · Gradio · FAISS · BM25 · sentence-transformers (embeddings and cross-encoder reranking) · Groq API (Llama 3.3) · PyMuPDF · pytest
+Python · Gradio · FAISS · BM25 · sentence-transformers · Groq (Llama 3.3) · PyMuPDF · pytest
 
 ## License
 
-Add a license before sharing (for example MIT) and put it in a `LICENSE` file.
+Add a license file before sharing (MIT is a common simple choice).
